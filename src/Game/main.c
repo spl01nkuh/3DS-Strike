@@ -72,14 +72,18 @@ void AcrMain() {
     u32 sysinfodisp;
     DEMMA_DEBUG = 0;
 
+    debug_print("AcrMain: flInitialize...");
     flInitialize(0, 0);
+    debug_print("AcrMain: flInitialize done");
     flSetRenderState(FLRENDER_BACKCOLOR, 0);
     //flSetDebugMode(0);
     system_init_level = 0;
     ppgWorkInitializeApprication();
     distributeScratchPadAddress();
     njdp2d_init();
+    debug_print("AcrMain: njUserInit...");
     njUserInit();
+    debug_print("AcrMain: njUserInit done");
     palCreateGhost();
     ppgMakeConvTableTexDC();
     appSetupBasePriority();
@@ -97,6 +101,7 @@ void AcrMain() {
     }
     setupScaling(render_mode);
 
+    debug_print("AcrMain: entering main loop");
     while (RUNNING) {
         if(g_request_pause){
             g_request_pause++;
@@ -354,7 +359,9 @@ void njUserInit() {
     u32 size;
 
     // Init AFS archive before anything tries to load files
+    debug_print("njUserInit: AFS init...");
     Setup_Directory_Record_Data();
+    debug_print("njUserInit: AFS ready");
 
     sysFF = 1;
     mpp_w.sysStop = false;
@@ -384,7 +391,9 @@ void njUserInit() {
 
     Init_sound_system();
     Init_bgm_work();
+    debug_print("njUserInit: sndInitialLoad...");
     sndInitialLoad();
+    debug_print("njUserInit: sndInitialLoad done");
     cpInitTask();
     cpReadyTask(TASK_INIT, Init_Task);
 }
