@@ -1,0 +1,49 @@
+#ifndef MAIN_H
+#define MAIN_H
+
+#include "structs.h"
+#include "types.h"
+
+
+typedef enum TaskID {
+    TASK_INIT = 0,
+    TASK_ENTRY = 1,
+    TASK_RESET = 2,
+    TASK_MENU = 3,
+    TASK_PAUSE = 4,
+    TASK_GAME = 5,
+    TASK_SAVER = 6,
+    TASK_DEBUG = 9,
+} TaskID;
+
+enum {
+    CLOCK_222 = 0
+    , CLOCK_266
+    , CLOCK_300
+    , CLOCK_333
+};
+
+#define INIT_TASK_NUM 0
+#define ENTRY_TASK_NUM 1
+#define RESET_TASK_NUM 2
+#define MENU_TASK_NUM 3
+#define PAUSE_TASK_NUM 4
+#define GAME_TASK_NUM 5
+#define SAVER_TASK_NUM 6
+#define DEBUG_TASK_NUM 9
+
+//#define PSP_FAT
+
+extern MPP mpp_w;             // size: 0x4C, address: 0x57A9F0
+extern s32 system_init_level; // size: 0x4, address: 0x57AA3C
+
+extern bool RUNNING;
+
+void AcrMain();
+void cpInitTask();
+void cpReadyTask(u16 num, void* func_adrs);
+void cpExitTask(u16 num);
+s32 mppGetFavoritePlayerNumber();
+extern void setClock(int clockMode);
+
+#endif

@@ -1,0 +1,8 @@
+build/
+build_wsl/
+*.obj
+*.o
+*.d
+PSP/
+3s-psp.zip
+3s-psp-experimental.zip

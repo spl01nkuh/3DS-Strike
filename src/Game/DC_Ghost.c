@@ -1,0 +1,444 @@
+#include "Game/DC_Ghost.h"
+#include "common.h"
+//#include "sf33rd/AcrSDK/ps2/flps2render.h"
+//#include "sf33rd/AcrSDK/ps2/foundaps2.h"
+#include "psp/PPGFile.h"
+#include "Game/AcrUtil.h"
+#include "Game/aboutspr.h"
+#include "Game/color3rd.h"
+//#include "PS2/ps2Quad.h"
+#include "structs.h"
+//#include <libvu0.h>
+
+#include "common/sprites.h"
+#include "common/graphics.h"
+#include "fl.h"
+
+#if !defined(TARGET_PS2)
+#include <string.h>
+#endif
+
+#define NTH_BYTE(value, n) ((((value >> n * 8) & 0xFF) << n * 8))
+
+typedef struct {
+    Vertex v;
+    u32 col;
+} _Polygon;
+
+// `col` needs to be `uintptr_t` because it sometimes stores a pointer to `WORK`
+typedef struct {
+    Vec3 v[4];
+    uintptr_t col;
+    u32 type;
+    s32 next;
+} NJDP2D_PRIM;
+
+typedef struct {
+    s16 ix1st;
+    s16 total;
+    NJDP2D_PRIM prim[100];
+} NJDP2D_W;
+
+NJDP2D_W njdp2d_w;
+MTX cmtx;
+
+void njUnitMatrix(MTX* mtx) {
+    if (mtx == NULL) {
+        mtx = &cmtx;
+    }
+
+    /*
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            mtx->a[i][j] = (i == j);
+        }
+    }
+    */
+    __asm__ volatile(
+        "vidt.q R100\n" //load identity matrix
+        "vidt.q R101\n"
+        "vidt.q R102\n"
+        "vidt.q R103\n"
+            
+        "sv.q   R100, 0(%0)\n"    // row 0
+        "sv.q   R101, 16(%0)\n"    // row 1
+        "sv.q   R102, 32(%0)\n"    // row 2
+        "sv.q   R103, 48(%0)\n"    // row 3
+        :
+        : "r"(mtx->a)
+        : "memory"
+    );
+}
+
+void njGetMatrix(MTX* m) {
+    *m = cmtx;
+}
+
+void njSetMatrix(MTX* md, MTX* ms) {
+    if (md == NULL) {
+        md = &cmtx;
+    }
+
+    *md = *ms;
+}
+
+void njScale(MTX* mtx, f32 x, f32 y, f32 z) {
+    if (mtx == NULL) {
+        mtx = &cmtx;
+    }
+
+    /*
+    for (int i = 0; i < 4; i++) {
+        mtx->a[0][i] *= x;
+        mtx->a[1][i] *= y;
+        mtx->a[2][i] *= z;
+    }
+    */
+    __asm__ volatile(
+        // load rows
+        "lv.q   R100, 0(%0)\n"     // row0
+        "lv.q   R101, 16(%0)\n"    // row1
+        "lv.q   R102, 32(%0)\n"    // row2
+
+        // load scalars
+        "mtv    %1, S000\n"
+        "mtv    %2, S001\n"
+        "mtv    %3, S002\n"
+
+        // scale
+        "vscl.q R100, R100, S000\n"
+        "vscl.q R101, R101, S001\n"
+        "vscl.q R102, R102, S002\n"
+
+        // store matrix back
+        "sv.q   R100, 0(%0)\n"     // row0
+        "sv.q   R101, 16(%0)\n"    // row1
+        "sv.q   R102, 32(%0)\n"    // row2
+        :
+        : "r"(mtx->a), "r"(x), "r"(y), "r"(z)
+        : "memory"
+    );
+}
+
+void njTranslate(MTX* mtx, f32 x, f32 y, f32 z) {
+    if (mtx == NULL) {
+        mtx = &cmtx;
+    }
+
+    /*
+    for (int i = 0; i < 4; i++) {
+        mtx->a[3][i] +=
+        mtx->a[0][i] * x +
+        mtx->a[1][i] * y +
+        mtx->a[2][i] * z;
+    }
+    */
+    __asm__ volatile (
+        // load rows
+        "lv.q   R100, 0(%0)\n"     // row0
+        "lv.q   R101, 16(%0)\n"    // row1
+        "lv.q   R102, 32(%0)\n"    // row2
+        "lv.q   R103, 48(%0)\n"    // row3
+
+        // load scalars
+        "mtv    %1, S000\n"
+        "mtv    %2, S001\n"
+        "mtv    %3, S002\n"
+
+        // temp = x * row0
+        "vscl.q R200, R100, S000\n"
+
+        // temp += y * row1
+        "vscl.q R201, R101, S001\n"
+        "vadd.q R200, R200, R201\n"
+
+        // temp += z * row2
+        "vscl.q R201, R102, S002\n"
+        "vadd.q R200, R200, R201\n"
+
+        // row3 += temp
+        "vadd.q R103, R103, R200\n"
+
+        // store row3
+        "sv.q   R103, 48(%0)\n"
+
+        :
+        : "r"(mtx->a), "r"(x), "r"(y), "r"(z)
+        : "memory"
+    );
+}
+
+void njSetBackColor(u32 c0, u32 c1, u32 c2) {
+    c0 = c0 | c1 | c2;
+    flSetRenderState(FLRENDER_BACKCOLOR, NTH_BYTE(c0, 3) | NTH_BYTE(c0, 2) | NTH_BYTE(c0, 1) | NTH_BYTE(c0, 0));
+}
+
+void njColorBlendingMode(s32 target, s32 mode) {
+    flSetRenderState(FLRENDER_ALPHABLENDMODE, 0x32);
+}
+
+void njCalcPoint(MTX* mtx, Vec3* ps, Vec3* pd) {
+    if (mtx == NULL) {
+        mtx = &cmtx;
+    }
+
+    /*
+    const f32 x = ps->x;
+    const f32 y = ps->y;
+    const f32 z = ps->z;
+    const f32 w = 1.0f;
+
+    pd->x = x * mtx->a[0][0] + y * mtx->a[1][0] + z * mtx->a[2][0] + w * mtx->a[3][0];
+    pd->y = x * mtx->a[0][1] + y * mtx->a[1][1] + z * mtx->a[2][1] + w * mtx->a[3][1];
+    pd->z = x * mtx->a[0][2] + y * mtx->a[1][2] + z * mtx->a[2][2] + w * mtx->a[3][2];
+    */
+    __asm__ volatile (
+        "lv.q   R100, 0(%0)\n"
+        "lv.q   R101, 16(%0)\n"
+        "lv.q   R102, 32(%0)\n"
+        "lv.q   R103, 48(%0)\n"
+
+        "lv.s   S000, 0(%1)\n"
+        "lv.s   S001, 4(%1)\n"
+        "lv.s   S002, 8(%1)\n"
+        "vone.s S003\n"
+
+        // row0
+        "vscl.q R200, R100, S000\n"
+
+        // row1
+        "vscl.q R201, R101, S001\n"
+        "vadd.q R200, R200, R201\n"
+
+        // row2
+        "vscl.q R201, R102, S002\n"
+        "vadd.q R200, R200, R201\n"
+
+        // row3 (translation)
+        "vadd.q R200, R200, R103\n"
+
+        // store result
+        "sv.s   S200, 0(%2)\n"
+        "sv.s   S210, 4(%2)\n"
+        "sv.s   S220, 8(%2)\n"
+
+        :
+        : "r"(mtx->a), "r"(ps), "r"(pd)
+        : "memory"
+    );
+}
+
+void njCalcPoints(MTX* mtx, Vec3* ps, Vec3* pd, s32 num) {
+    s32 i;
+
+    if (mtx == NULL) {
+        mtx = &cmtx;
+    }
+
+    for (i = 0; i < num; i++) {
+        njCalcPoint(mtx, ps++, pd++);
+    }
+}
+
+void njDrawTexture(Polygon* polygon, s32 /* unused */, s32 tex, s32 /* unused */) {
+    Vertex vtx[4];
+    s32 i;
+
+    for (i = 0; i < 4; i++) {
+        vtx[i] = ((_Polygon*)polygon)[i].v;
+    }
+
+    ppgWriteQuadWithST_B(vtx, polygon[0].col, NULL, tex, -1);
+}
+
+void njDrawSprite(Polygon* polygon, s32 /* unused */, s32 tex, s32 /* unused */) {
+    Vertex vtx[4];
+
+    //if ((polygon[0].x >= 384.0f) || (polygon[3].x < 0.0f) || (polygon[0].y >= 224.0f) || (polygon[3].y < 0.0f)) {
+    if ((polygon[0].x >= Max_X) || (polygon[3].x < Min_X) || (polygon[0].y >= Max_Y) || (polygon[3].y < Min_Y)) {
+        return;
+    }
+
+    vtx[0] = ((_Polygon*)polygon)[0].v;
+    vtx[3] = ((_Polygon*)polygon)[3].v;
+
+
+    ppgWriteQuadWithST_B2(vtx, polygon[0].col, 0, tex, -1);
+}
+
+void njdp2d_init() {
+    njdp2d_w.ix1st = -1;
+    njdp2d_w.total = 0;
+}
+
+
+
+void njdp2d_draw_0() {
+    ColorVertex *vertices, *vertices_total;
+    s32 i, j, k, w = 0;
+
+    for (i = njdp2d_w.ix1st; i != -1; i = njdp2d_w.prim[i].next) {
+        if(njdp2d_w.prim[i].type == 0)
+            w += 6;
+    }
+
+    if(DEMMA_DEBUG || skip_frame){
+        njdp2d_init();
+        return;
+    }
+    vertices_total = (ColorVertex*) sceGuGetMemory(w * sizeof(ColorVertex));
+    if(vertices_total == NULL){
+        njdp2d_init();
+        return;
+    }
+
+    w = 0;
+
+    sceGuDisable(GU_TEXTURE_2D);
+
+    for (i = njdp2d_w.ix1st; i != -1; i = njdp2d_w.prim[i].next) {
+        if (njdp2d_w.prim[i].type == 0) {
+            vertices = &vertices_total[w];
+
+            for(j = 0; j < 3; j++){
+                k = -j + 5;
+                vertices[k].x = vertices[j].x = SCALE_X(njdp2d_w.prim[i].v[j].x);
+                vertices[k].y = vertices[j].y = SCALE_Y(njdp2d_w.prim[i].v[j].y);
+                /*__asm__ volatile (
+                    "mtv %2, S000\n"    // load njdp2d_w.prim[i].v[j].x to matrix
+                    "mtv %3, S001\n"    // load njdp2d_w.prim[i].v[j].y to matrix
+
+                    "vmul.p C000, C000, C410\n" // multiply matrix (scale)
+                    "vadd.p C000, C000, C420\n" // add matrix (offset)
+
+                    "mfv %0, S000\n"    // store in vertices[j].x
+                    "mfv %1, S001\n"    // store in vertices[j].y
+                    : "=r"(vertices[j].x), "=r"(vertices[j].y)  // %0 = vertices[j].x, %1 = vertices[j].y;
+                    : "r"(njdp2d_w.prim[i].v[j].x), "r"(njdp2d_w.prim[i].v[j].y)    // %2 = njdp2d_w.prim[i].v[j].x, %3 = njdp2d_w.prim[i].v[j].y;
+                );*/
+                vertices[k].x = vertices[j].x;
+                vertices[k].y = vertices[j].y;
+                vertices[k].z = vertices[j].z = njdp2d_w.prim[i].v[j].z;
+                vertices[k].colour = vertices[j].colour = fixARGB(njdp2d_w.prim[i].col);
+            }
+            vertices[5].x = SCALE_X(njdp2d_w.prim[i].v[j].x);
+            vertices[5].y = SCALE_Y(njdp2d_w.prim[i].v[j].y);
+            /*__asm__ volatile (
+                "mtv %2, S000\n"    // load njdp2d_w.prim[i].v[j].x to matrix
+                "mtv %3, S001\n"    // load njdp2d_w.prim[i].v[j].y to matrix
+
+                "vmul.p C000, C000, C410\n" // multiply matrix (scale)
+                "vadd.p C000, C000, C420\n" // add matrix (offset)
+
+                "mfv %0, S000\n"    // store in vertices[j].x
+                "mfv %1, S001\n"    // store in vertices[j].y
+                : "=r"(vertices[5].x), "=r"(vertices[5].y)  // %0 = vertices[5].x, %1 = vertices[5].y;
+                : "r"(njdp2d_w.prim[i].v[j].x), "r"(njdp2d_w.prim[i].v[j].y)    // %2 = njdp2d_w.prim[i].v[j].x, %3 = njdp2d_w.prim[i].v[j].y;
+            );*/
+            
+            vertices[5].z = njdp2d_w.prim[i].v[j].z;
+            vertices[5].colour = vertices[j].colour;
+            w += 6;
+        }
+    }
+    if(!DEMMA_DEBUG && !skip_frame)
+        sceGuDrawArray(GU_TRIANGLES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, w, 0, vertices_total);
+    sceGuEnable(GU_TEXTURE_2D);
+    njdp2d_init();
+}
+
+void njdp2d_draw_1() {
+    s32 i;
+    for (i = njdp2d_w.ix1st; i != -1; i = njdp2d_w.prim[i].next) {
+        if (njdp2d_w.prim[i].type == 1) {
+            shadow_drawing((WORK*)njdp2d_w.prim[i].col, njdp2d_w.prim[i].v[0].y);
+        }
+    }
+}
+
+// `col` needs to be `uintptr_t` because it sometimes stores a pointer to `WORK`
+void njdp2d_sort(f32* pos, f32 pri, uintptr_t col, s32 flag) {
+    s32 i;
+    s32 ix = njdp2d_w.total;
+    s32 prev;
+
+    if (ix >= 100) {
+        // The 2D polygon display request has exceeded the buffer\n
+        flLogOut("The 2D polygon display request has exceeded the buffer\n");
+        return;
+    }
+
+    if (flag == 0) {
+        njdp2d_w.prim[ix].v[0].z = njdp2d_w.prim[ix].v[1].z = njdp2d_w.prim[ix].v[2].z = njdp2d_w.prim[ix].v[3].z = pri;
+        njdp2d_w.prim[ix].v[0].x = pos[0];
+        njdp2d_w.prim[ix].v[0].y = pos[1];
+        njdp2d_w.prim[ix].v[1].x = pos[2];
+        njdp2d_w.prim[ix].v[1].y = pos[3];
+        njdp2d_w.prim[ix].v[2].x = pos[4];
+        njdp2d_w.prim[ix].v[2].y = pos[5];
+        njdp2d_w.prim[ix].v[3].x = pos[6];
+        njdp2d_w.prim[ix].v[3].y = pos[7];
+        njdp2d_w.prim[ix].type = 0;
+        njdp2d_w.prim[ix].col = col;
+    }
+
+    if (flag == 1) {
+        njdp2d_w.prim[ix].v[0].z = pri;
+        njdp2d_w.prim[ix].v[0].y = pos[0];
+        njdp2d_w.prim[ix].type = 1;
+        njdp2d_w.prim[ix].col = col;
+    }
+
+    njdp2d_w.prim[ix].next = -1;
+
+    if (njdp2d_w.ix1st == -1) {
+        njdp2d_w.ix1st = njdp2d_w.total;
+    } else {
+        i = njdp2d_w.ix1st;
+        prev = -1;
+
+        while (1) {
+            if (pri > njdp2d_w.prim[i].v[0].z) {
+                if (prev == -1) {
+                    njdp2d_w.ix1st = ix;
+                    njdp2d_w.prim[ix].next = i;
+                } else {
+                    njdp2d_w.prim[prev].next = ix;
+                    njdp2d_w.prim[ix].next = i;
+                }
+
+                break;
+            }
+
+            if (njdp2d_w.prim[i].next == -1) {
+                njdp2d_w.prim[i].next = ix;
+                break;
+            }
+
+            prev = i;
+            i = njdp2d_w.prim[i].next;
+        }
+    }
+
+    njdp2d_w.total += 1;
+}
+
+void njDrawPolygon2D(PAL_CURSOR* p, s32 /* unused */, f32 pri, u32 attr) {
+    if (attr & 0x20) {
+        njdp2d_sort((f32*)p->p, pri, p->col->color, 0);
+    }
+}
+
+void njSetPaletteBankNumG(u32 globalIndex, s32 bank) {
+    ppgSetupCurrentPaletteNumber(0, bank);
+}
+
+void njSetPaletteData(s32 offset, s32 count, void* data) {
+    palCopyGhostDC(offset, count, data);
+    palUpdateGhostDC();
+}
+
+s32 njReLoadTexturePartNumG(u32 gix, u8* srcAdrs, u32 ofs, u32 size) {
+    ppgRenewDotDataSeqs(gix, srcAdrs, ofs, size);
+    return 1;
+}
