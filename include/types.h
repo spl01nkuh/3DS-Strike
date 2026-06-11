@@ -62,11 +62,15 @@ typedef double f64;
 typedef size_t strlen_t;
 
 // SCE types
+// newlib's <sys/types.h> already typedefs u_char/u_short/u_int/u_long (BSD
+// compat), and its u_long is 32-bit on ARM. The decompiled PS2 code needs
+// u_long to be 64-bit, so shadow the newlib typedefs with macros instead of
+// redeclaring them.
 
-typedef uint8_t u_char;
-typedef uint16_t u_short;
-typedef uint32_t u_int;
-typedef uint64_t u_long;
+#define u_char uint8_t
+#define u_short uint16_t
+#define u_int uint32_t
+#define u_long uint64_t
 
 #endif
 

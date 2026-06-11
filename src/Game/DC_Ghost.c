@@ -47,27 +47,12 @@ void njUnitMatrix(MTX* mtx) {
         mtx = &cmtx;
     }
 
-    /*
+    /* VFPU removed for 3DS — original C restored */
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
             mtx->a[i][j] = (i == j);
         }
     }
-    */
-    __asm__ volatile(
-        "vidt.q R100\n" //load identity matrix
-        "vidt.q R101\n"
-        "vidt.q R102\n"
-        "vidt.q R103\n"
-            
-        "sv.q   R100, 0(%0)\n"    // row 0
-        "sv.q   R101, 16(%0)\n"    // row 1
-        "sv.q   R102, 32(%0)\n"    // row 2
-        "sv.q   R103, 48(%0)\n"    // row 3
-        :
-        : "r"(mtx->a)
-        : "memory"
-    );
 }
 
 void njGetMatrix(MTX* m) {
@@ -87,37 +72,12 @@ void njScale(MTX* mtx, f32 x, f32 y, f32 z) {
         mtx = &cmtx;
     }
 
-    /*
+    /* VFPU removed for 3DS — original C restored */
     for (int i = 0; i < 4; i++) {
         mtx->a[0][i] *= x;
         mtx->a[1][i] *= y;
         mtx->a[2][i] *= z;
     }
-    */
-    __asm__ volatile(
-        // load rows
-        "lv.q   R100, 0(%0)\n"     // row0
-        "lv.q   R101, 16(%0)\n"    // row1
-        "lv.q   R102, 32(%0)\n"    // row2
-
-        // load scalars
-        "mtv    %1, S000\n"
-        "mtv    %2, S001\n"
-        "mtv    %3, S002\n"
-
-        // scale
-        "vscl.q R100, R100, S000\n"
-        "vscl.q R101, R101, S001\n"
-        "vscl.q R102, R102, S002\n"
-
-        // store matrix back
-        "sv.q   R100, 0(%0)\n"     // row0
-        "sv.q   R101, 16(%0)\n"    // row1
-        "sv.q   R102, 32(%0)\n"    // row2
-        :
-        : "r"(mtx->a), "r"(x), "r"(y), "r"(z)
-        : "memory"
-    );
 }
 
 void njTranslate(MTX* mtx, f32 x, f32 y, f32 z) {
@@ -125,47 +85,13 @@ void njTranslate(MTX* mtx, f32 x, f32 y, f32 z) {
         mtx = &cmtx;
     }
 
-    /*
+    /* VFPU removed for 3DS — original C restored */
     for (int i = 0; i < 4; i++) {
         mtx->a[3][i] +=
         mtx->a[0][i] * x +
         mtx->a[1][i] * y +
         mtx->a[2][i] * z;
     }
-    */
-    __asm__ volatile (
-        // load rows
-        "lv.q   R100, 0(%0)\n"     // row0
-        "lv.q   R101, 16(%0)\n"    // row1
-        "lv.q   R102, 32(%0)\n"    // row2
-        "lv.q   R103, 48(%0)\n"    // row3
-
-        // load scalars
-        "mtv    %1, S000\n"
-        "mtv    %2, S001\n"
-        "mtv    %3, S002\n"
-
-        // temp = x * row0
-        "vscl.q R200, R100, S000\n"
-
-        // temp += y * row1
-        "vscl.q R201, R101, S001\n"
-        "vadd.q R200, R200, R201\n"
-
-        // temp += z * row2
-        "vscl.q R201, R102, S002\n"
-        "vadd.q R200, R200, R201\n"
-
-        // row3 += temp
-        "vadd.q R103, R103, R200\n"
-
-        // store row3
-        "sv.q   R103, 48(%0)\n"
-
-        :
-        : "r"(mtx->a), "r"(x), "r"(y), "r"(z)
-        : "memory"
-    );
 }
 
 void njSetBackColor(u32 c0, u32 c1, u32 c2) {
@@ -182,7 +108,7 @@ void njCalcPoint(MTX* mtx, Vec3* ps, Vec3* pd) {
         mtx = &cmtx;
     }
 
-    /*
+    /* VFPU removed for 3DS — original C restored */
     const f32 x = ps->x;
     const f32 y = ps->y;
     const f32 z = ps->z;
@@ -191,41 +117,6 @@ void njCalcPoint(MTX* mtx, Vec3* ps, Vec3* pd) {
     pd->x = x * mtx->a[0][0] + y * mtx->a[1][0] + z * mtx->a[2][0] + w * mtx->a[3][0];
     pd->y = x * mtx->a[0][1] + y * mtx->a[1][1] + z * mtx->a[2][1] + w * mtx->a[3][1];
     pd->z = x * mtx->a[0][2] + y * mtx->a[1][2] + z * mtx->a[2][2] + w * mtx->a[3][2];
-    */
-    __asm__ volatile (
-        "lv.q   R100, 0(%0)\n"
-        "lv.q   R101, 16(%0)\n"
-        "lv.q   R102, 32(%0)\n"
-        "lv.q   R103, 48(%0)\n"
-
-        "lv.s   S000, 0(%1)\n"
-        "lv.s   S001, 4(%1)\n"
-        "lv.s   S002, 8(%1)\n"
-        "vone.s S003\n"
-
-        // row0
-        "vscl.q R200, R100, S000\n"
-
-        // row1
-        "vscl.q R201, R101, S001\n"
-        "vadd.q R200, R200, R201\n"
-
-        // row2
-        "vscl.q R201, R102, S002\n"
-        "vadd.q R200, R200, R201\n"
-
-        // row3 (translation)
-        "vadd.q R200, R200, R103\n"
-
-        // store result
-        "sv.s   S200, 0(%2)\n"
-        "sv.s   S210, 4(%2)\n"
-        "sv.s   S220, 8(%2)\n"
-
-        :
-        : "r"(mtx->a), "r"(ps), "r"(pd)
-        : "memory"
-    );
 }
 
 void njCalcPoints(MTX* mtx, Vec3* ps, Vec3* pd, s32 num) {

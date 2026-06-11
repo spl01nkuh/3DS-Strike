@@ -1,11 +1,19 @@
-cmake_minimum_required(VERSION 3.11)
+cmake_minimum_required(VERSION 3.13)
 
-project(3rd-strike)
+# Build with:
+#   cmake -S . -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/3DS.cmake
+#   cmake --build build
+
+project(3rd-strike C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-file(GLOB pspC src/psp/*.c)
+if(NOT NINTENDO_3DS)
+    message(FATAL_ERROR "This tree builds the 3DS port — use the devkitPro 3DS.cmake toolchain")
+endif()
+
+file(GLOB ctrC src/ctr/*.c)
 file(GLOB commonC src/common/*.c)
 file(GLOB gameC src/Game/*.c)
 file(GLOB debugC src/Game/debug/*.c)
@@ -22,9 +30,24 @@ file(GLOB gameSoundC src/Game/sound/*.c)
 file(GLOB acrSndC src/sf33rd/AcrSDK/MiddleWare/PS2/CapSndEng/*.c)
 file(GLOB cseDataC src/sf33rd/Source/PS2/cseDataFiles/*.c)
 
+# psp/ files kept: portable logic that compiles against the pspshim layer.
+# Excluded: pspmain.c pspPAD.c savesub.c at3.c icon0.c (replaced by src/ctr/).
+set(pspKeepC
+    src/psp/adx.c
+    src/psp/afs.c
+    src/psp/common.c
+    src/psp/files.c
+    src/psp/fl.c
+    src/psp/flps2etc.c
+    src/psp/MemMan.c
+    src/psp/PPGFile.c
+    src/psp/PPGWork.c
+)
+
 add_executable(${PROJECT_NAME}
-	${pspC}
-	${commonC}
+    ${ctrC}
+    ${pspKeepC}
+    ${commonC}
     ${gameC}
     ${debugC}
     ${message3rdC}
@@ -40,32 +63,19 @@ add_executable(${PROJECT_NAME}
     ${cseDataC}
 )
 
-set_source_files_properties(src/psp/icon0.c PROPERTIES COMPILE_FLAGS "-G0")
-
-target_include_directories(
-    ${PROJECT_NAME} PRIVATE src
-    ${PROJECT_NAME} PRIVATE include
-    ${PROJECT_NAME} PRIVATE include/Compress/zlib
-    ${PROJECT_NAME} PRIVATE include/port/sound
-    ${PROJECT_NAME} PRIVATE include/Game/sound
-    ${PROJECT_NAME} PRIVATE include/sf33rd/AcrSDK/MiddleWare/PS2/CapSndEng
-    ${PROJECT_NAME} PRIVATE include/sf33rd/Source/PS2/cseDataFiles
+target_include_directories(${PROJECT_NAME} PRIVATE
+    include/pspshim
+    src
+    include
+    include/Compress/zlib
+    include/port/sound
+    include/Game/sound
+    include/sf33rd/AcrSDK/MiddleWare/PS2/CapSndEng
+    include/sf33rd/Source/PS2/cseDataFiles
 )
 
-target_link_libraries(${PROJECT_NAME} PRIVATE
-    pspdebug
-    pspdisplay
-    pspge
-    pspgu
-    pspctrl
-    psppower
-    
-    pspaudio
-    pspaudiolib
-    pspatrac3
-)
+target_link_libraries(${PROJECT_NAME} PRIVATE citro3d ctru m)
 
-# from 3sx CMakeLists
 set(DISABLED_WARNINGS
     -Wno-unused-but-set-variable
     -Wno-pointer-sign
@@ -88,24 +98,19 @@ set(DISABLED_WARNINGS
     -Wno-int-conversion
 )
 
-target_compile_options(${PROJECT_NAME}  PRIVATE
+target_compile_options(${PROJECT_NAME} PRIVATE
     -Wall
-    -O3 -ffast-math
-
+    -O2
     -fno-strict-aliasing
-
     ${DISABLED_WARNINGS}
 )
 
-
-# Create an EBOOT.PBP file
-create_pbp_file(
-    TARGET ${PROJECT_NAME}
-    ICON_PATH ${CMAKE_SOURCE_DIR}/ICON0.PNG
-    BACKGROUND_PATH ${CMAKE_SOURCE_DIR}/PIC1.PNG
-    MUSIC_PATH ${CMAKE_SOURCE_DIR}/57.at3
-    PREVIEW_PATH NULL
-    TITLE ${PROJECT_NAME}
-    VERSION 01.01
+ctr_generate_smdh(${PROJECT_NAME}.smdh
+    NAME "SFIII 3rd Strike"
+    DESCRIPTION "Street Fighter III 3rd Strike port"
+    AUTHOR "3s decomp community"
 )
 
+ctr_create_3dsx(${PROJECT_NAME}
+    SMDH ${PROJECT_NAME}.smdh
+)

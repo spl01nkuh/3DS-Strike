@@ -3,7 +3,6 @@
 
 // libraries
 #include <pspuser.h>
-#include <stb_image.h>
 #include <stdbool.h>
 
 // custom
@@ -19,14 +18,7 @@ typedef struct {
     float x, y, z;
 } ColorVertex;
 
-/*
 typedef struct {
-    float u, v;
-    uint32_t colour;
-    float x, y, z;
-} TextureVertex;
- */
- typedef struct {
     short u, v;
     uint32_t colour;
     float x, y, z;

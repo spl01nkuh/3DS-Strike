@@ -9,10 +9,10 @@
 // custom
 #include "sprites.h"
 
-// constants
+// constants — 3DS top screen
 #define BUFFER_WIDTH 512
-#define SCREEN_WIDTH 480
-#define SCREEN_HEIGHT 272
+#define SCREEN_WIDTH 400
+#define SCREEN_HEIGHT 240
 
 // Scaling macros — switch between fullscreen and native
 extern float Scale_Factor_X;
@@ -38,7 +38,8 @@ extern "C" {
 #define SCREEN_MODE_VERTICAL    3
 #define SCREEN_MODE_EXTENDED    4
 
-#define SCREEN_DEFAULT_MODE     SCREEN_MODE_STRETCH
+/* 3DS: native 1:1 is the showcase mode (384x224 in 400x240) */
+#define SCREEN_DEFAULT_MODE     SCREEN_MODE_NATIVE
 #define SCREEN_DEFAULT_FILTER   1
 #define SCREEN_DEFAULT_RTT      0
 
