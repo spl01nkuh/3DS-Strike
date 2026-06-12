@@ -42,6 +42,8 @@ typedef struct {
     uint32_t data_sum; /* full content checksum — detects CPU-side melt writes */
     uint32_t check_frame;
     uint32_t dirty_min, dirty_max; /* byte range written by melt hooks; min>max = clean */
+    uint32_t drawn_frame;          /* draws are deferred to frame end — never mutate
+                                      a texture already referenced this frame */
     int w, h, format, swizzled;
     int valid;
     int tex_alive; /* C3D_Tex allocated (reused across evictions of same dims) */
@@ -208,6 +210,28 @@ static int convert_texture_into(TexCacheEntry *e, int y0, int y1) {
             pal5551[i] = conv5551(pal[i]);
     }
 
+    if (e->format == GU_PSM_T4 && pal) {
+        /* hot path: two texels per source byte; horizontally adjacent
+         * texels are consecutive u16s inside a Morton tile, so a 256-entry
+         * pair-LUT lets us emit both with one u32 store */
+        uint32_t lut[256];
+        for (int b = 0; b < 256; b++)
+            lut[b] = (uint32_t)pal5551[b & 0xF] | ((uint32_t)pal5551[b >> 4] << 16);
+        uint32_t *dst32 = (uint32_t *)dst;
+        for (int y = y0; y < y1; y++) {
+            const uint8_t *row = src + y * row_bytes;
+            uint32_t ybase = ((uint32_t)y >> 3) * ((uint32_t)w >> 3) * 64;
+            uint32_t ym = morton7(0, (uint32_t)y & 7);
+            for (int x = 0; x < w; x += 2) {
+                uint32_t off = ybase + (((uint32_t)x >> 3) * 64 | ym | morton7((uint32_t)x & 7, 0));
+                dst32[off >> 1] = lut[row[x >> 1]];
+            }
+        }
+        free(linear);
+        C3D_TexFlush(&e->tex);
+        return 1;
+    }
+
     for (int y = y0; y < y1; y++) {
         const uint8_t *row = src + y * row_bytes;
         for (int x = 0; x < w; x++) {
@@ -277,8 +301,13 @@ static TexCacheEntry *resolve_texture(void) {
                        : 0;
 
     TexCacheEntry *lru = &s_cache[0];
+    TexCacheEntry *pal_reuse = NULL; /* same pixels, different palette (cycling) */
     for (int i = 0; i < TEXCACHE_SIZE; i++) {
         TexCacheEntry *e = &s_cache[i];
+        if (e->valid && e->tex_ptr == s_gu.tex_ptr && e->w == s_gu.tex_w && e->h == s_gu.tex_h &&
+            e->format == s_gu.format && e->swizzled == s_gu.swizzled &&
+            (e->clut_ptr != s_gu.clut_ptr || e->clut_sum != sum) && e->drawn_frame != s_frame_id)
+            pal_reuse = e;
         if (e->valid && e->tex_ptr == s_gu.tex_ptr && e->clut_ptr == s_gu.clut_ptr && e->clut_sum == sum &&
             e->w == s_gu.tex_w && e->h == s_gu.tex_h && e->format == s_gu.format && e->swizzled == s_gu.swizzled) {
             /* melt hooks report exact byte ranges — reconvert only those
@@ -304,12 +333,35 @@ static TexCacheEntry *resolve_texture(void) {
                 }
             }
             e->last_use = ++s_use_counter;
+            e->drawn_frame = s_frame_id;
             return e;
         }
         if (!e->valid)
             lru = e;
-        else if (lru->valid && e->last_use < lru->last_use)
+        else if (lru->valid && e->drawn_frame != s_frame_id &&
+                 (lru->drawn_frame == s_frame_id || e->last_use < lru->last_use))
             lru = e;
+    }
+
+    /* never evict a texture already referenced by this frame's deferred
+     * draws — the GPU reads it at frame end */
+    if (lru->valid && lru->drawn_frame == s_frame_id)
+        return NULL;
+
+    /* palette-cycling fast path: same pixels under a new palette — reuse
+     * the entry and reconvert in place instead of evicting other textures */
+    if (pal_reuse) {
+        pal_reuse->clut_ptr = s_gu.clut_ptr;
+        pal_reuse->clut_sum = sum;
+        pal_reuse->dirty_min = 1;
+        pal_reuse->dirty_max = 0;
+        if (!convert_texture_into(pal_reuse, 0, pal_reuse->h)) {
+            pal_reuse->valid = 0;
+            return NULL;
+        }
+        pal_reuse->last_use = ++s_use_counter;
+        pal_reuse->drawn_frame = s_frame_id;
+        return pal_reuse;
     }
 
     /* miss — evict lru, keeping its GPU allocation when dims match */
