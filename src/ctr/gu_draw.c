@@ -41,8 +41,10 @@ typedef struct {
     uint32_t clut_sum;
     uint32_t data_sum; /* full content checksum — detects CPU-side melt writes */
     uint32_t check_frame;
+    uint32_t dirty_min, dirty_max; /* byte range written by melt hooks; min>max = clean */
     int w, h, format, swizzled;
     int valid;
+    int tex_alive; /* C3D_Tex allocated (reused across evictions of same dims) */
     uint32_t last_use;
     C3D_Tex tex;
 } TexCacheEntry;
@@ -92,18 +94,29 @@ void ctrGuTexcacheInvalidate(const void *src) {
         if (!s_cache[i].valid)
             continue;
         if (src == NULL || s_cache[i].tex_ptr == src) {
-            C3D_TexDelete(&s_cache[i].tex);
+            if (s_cache[i].tex_alive) {
+                C3D_TexDelete(&s_cache[i].tex);
+                s_cache[i].tex_alive = 0;
+            }
             s_cache[i].valid = 0;
         }
     }
 }
 
 /* called from the melt/tile-streaming writers (ppgRenewDotDataSeqs etc.):
- * mark conversions of this sheet stale so the next bind refreshes them */
-void ctrGuTexcacheNotifyWrite(const void *sheet_base) {
+ * record the written byte range so the next bind reconverts only that span */
+void ctrGuTexcacheNotifyWrite(const void *sheet_base, uint32_t start, uint32_t end) {
     for (int i = 0; i < TEXCACHE_SIZE; i++) {
-        if (s_cache[i].valid && s_cache[i].tex_ptr == sheet_base)
-            s_cache[i].data_sum = 0xDEADD1A7; /* force checksum mismatch */
+        TexCacheEntry *e = &s_cache[i];
+        if (e->valid && e->tex_ptr == sheet_base) {
+            if (e->dirty_min > e->dirty_max) {
+                e->dirty_min = start;
+                e->dirty_max = end;
+            } else {
+                if (start < e->dirty_min) e->dirty_min = start;
+                if (end > e->dirty_max) e->dirty_max = end;
+            }
+        }
     }
 }
 
@@ -157,9 +170,12 @@ static void psp_unswizzle(uint8_t *out, const uint8_t *in, uint32_t width_bytes,
     }
 }
 
-/* fill an already-allocated C3D_Tex from the (indexed/16-bit) source */
-static int convert_texture_into(TexCacheEntry *e) {
+/* fill rows [y0, y1) of an already-allocated C3D_Tex from the source */
+static int convert_texture_into(TexCacheEntry *e, int y0, int y1) {
     int w = e->w, h = e->h;
+
+    if (y0 < 0) y0 = 0;
+    if (y1 > h) y1 = h;
 
     const uint8_t *src = (const uint8_t *)e->tex_ptr;
     uint8_t *linear = NULL;
@@ -192,7 +208,7 @@ static int convert_texture_into(TexCacheEntry *e) {
             pal5551[i] = conv5551(pal[i]);
     }
 
-    for (int y = 0; y < h; y++) {
+    for (int y = y0; y < y1; y++) {
         const uint8_t *row = src + y * row_bytes;
         for (int x = 0; x < w; x++) {
             uint16_t out;
@@ -226,20 +242,26 @@ static int convert_texture_into(TexCacheEntry *e) {
     return 1;
 }
 
-/* allocate + fill a native texture for a cache entry */
+/* allocate (or reuse) + fill a native texture for a cache entry */
 static int convert_texture(TexCacheEntry *e) {
-    if (!C3D_TexInit(&e->tex, (u16)e->w, (u16)e->h, GPU_RGBA5551)) {
-        debug_print("gu_draw: C3D_TexInit %dx%d FAILED", e->w, e->h);
-        return 0;
+    if (!e->tex_alive) {
+        if (!C3D_TexInit(&e->tex, (u16)e->w, (u16)e->h, GPU_RGBA5551)) {
+            debug_print("gu_draw: C3D_TexInit %dx%d FAILED", e->w, e->h);
+            return 0;
+        }
+        C3D_TexSetFilter(&e->tex, GPU_NEAREST, GPU_NEAREST);
+        C3D_TexSetWrap(&e->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        e->tex_alive = 1;
     }
-    C3D_TexSetFilter(&e->tex, GPU_NEAREST, GPU_NEAREST);
-    C3D_TexSetWrap(&e->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
 
     e->data_sum = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
     e->check_frame = s_frame_id;
+    e->dirty_min = 1;
+    e->dirty_max = 0;
 
-    if (!convert_texture_into(e)) {
+    if (!convert_texture_into(e, 0, e->h)) {
         C3D_TexDelete(&e->tex);
+        e->tex_alive = 0;
         return 0;
     }
     return 1;
@@ -259,19 +281,26 @@ static TexCacheEntry *resolve_texture(void) {
         TexCacheEntry *e = &s_cache[i];
         if (e->valid && e->tex_ptr == s_gu.tex_ptr && e->clut_ptr == s_gu.clut_ptr && e->clut_sum == sum &&
             e->w == s_gu.tex_w && e->h == s_gu.tex_h && e->format == s_gu.format && e->swizzled == s_gu.swizzled) {
-            /* melt writers notify us directly (data_sum forced stale);
-             * the periodic checksum is only a safety net for writers we
-             * haven't hooked */
-            if (e->data_sum == 0xDEADD1A7 || s_frame_id - e->check_frame >= 30) {
+            /* melt hooks report exact byte ranges — reconvert only those
+             * rows; the periodic checksum is a safety net for unhooked
+             * writers */
+            if (e->dirty_min <= e->dirty_max) {
+                uint32_t rb = (e->format == GU_PSM_T4) ? (uint32_t)e->w / 2
+                              : (e->format == GU_PSM_T8) ? (uint32_t)e->w
+                                                         : (uint32_t)e->w * 2;
+                int y0 = (int)(e->dirty_min / rb);
+                int y1 = (int)(e->dirty_max / rb) + 1;
+                e->dirty_min = 1;
+                e->dirty_max = 0;
+                convert_texture_into(e, y0, y1);
+                e->data_sum = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
+                e->check_frame = s_frame_id;
+            } else if (s_frame_id - e->check_frame >= 30) {
                 e->check_frame = s_frame_id;
                 uint32_t ds = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
                 if (ds != e->data_sum) {
                     e->data_sum = ds;
-                    if (!convert_texture_into(e)) {
-                        C3D_TexDelete(&e->tex);
-                        e->valid = 0;
-                        return NULL;
-                    }
+                    convert_texture_into(e, 0, e->h);
                 }
             }
             e->last_use = ++s_use_counter;
@@ -283,10 +312,13 @@ static TexCacheEntry *resolve_texture(void) {
             lru = e;
     }
 
-    /* miss — evict lru */
+    /* miss — evict lru, keeping its GPU allocation when dims match */
     if (lru->valid) {
-        C3D_TexDelete(&lru->tex);
         lru->valid = 0;
+        if (lru->tex_alive && (lru->w != s_gu.tex_w || lru->h != s_gu.tex_h)) {
+            C3D_TexDelete(&lru->tex);
+            lru->tex_alive = 0;
+        }
     }
 
     lru->tex_ptr = s_gu.tex_ptr;
