@@ -33,12 +33,14 @@ static GuState s_gu;
 
 /* ------------------------------------------------------ texture cache -- */
 
-#define TEXCACHE_SIZE 24
+#define TEXCACHE_SIZE 48
 
 typedef struct {
     const void *tex_ptr;
     const void *clut_ptr;
     uint32_t clut_sum;
+    uint32_t data_sum; /* full content checksum — detects CPU-side melt writes */
+    uint32_t check_frame;
     int w, h, format, swizzled;
     int valid;
     uint32_t last_use;
@@ -56,16 +58,32 @@ void ctrGuInit(void) {
     C2D_SetTintMode(C2D_TintMult);
 }
 
+static uint32_t s_frame_id;
+
 void ctrGuFrameBegin(void) {
-    /* T4 sheets are the game's dynamic sprite caches — tiles are melted
-     * into them between frames without the pointer changing, so cached
-     * conversions go stale. Reconvert them once per frame.
-     * TODO(old-3ds): replace with dirty-region hooks in the ppg melt path. */
-    for (int i = 0; i < TEXCACHE_SIZE; i++) {
-        if (s_cache[i].valid && s_cache[i].format == GU_PSM_T4) {
-            C3D_TexDelete(&s_cache[i].tex);
-            s_cache[i].valid = 0;
-        }
+    /* Dynamic sheets (texcash melts) are detected by content checksum at
+     * first bind each frame — see resolve_texture.
+     * TODO(old-3ds): replace checksums with dirty hooks in the melt path. */
+    s_frame_id++;
+}
+
+static uint32_t data_checksum(const void *p, size_t bytes) {
+    const uint32_t *u = (const uint32_t *)p;
+    size_t n = bytes / 4;
+    uint32_t a = 0, b = 0;
+    for (size_t i = 0; i < n; i++) {
+        a ^= u[i];
+        b += u[i];
+    }
+    return a ^ (b << 1);
+}
+
+static size_t src_bytes(int format, int w, int h) {
+    switch (format) {
+    case GU_PSM_T4: return (size_t)w * h / 2;
+    case GU_PSM_T8: return (size_t)w * h;
+    case GU_PSM_8888: return (size_t)w * h * 4;
+    default: return (size_t)w * h * 2;
     }
 }
 
@@ -77,6 +95,15 @@ void ctrGuTexcacheInvalidate(const void *src) {
             C3D_TexDelete(&s_cache[i].tex);
             s_cache[i].valid = 0;
         }
+    }
+}
+
+/* called from the melt/tile-streaming writers (ppgRenewDotDataSeqs etc.):
+ * mark conversions of this sheet stale so the next bind refreshes them */
+void ctrGuTexcacheNotifyWrite(const void *sheet_base) {
+    for (int i = 0; i < TEXCACHE_SIZE; i++) {
+        if (s_cache[i].valid && s_cache[i].tex_ptr == sheet_base)
+            s_cache[i].data_sum = 0xDEADD1A7; /* force checksum mismatch */
     }
 }
 
@@ -130,16 +157,9 @@ static void psp_unswizzle(uint8_t *out, const uint8_t *in, uint32_t width_bytes,
     }
 }
 
-/* expand indexed/16-bit source into a Morton-tiled RGB5A1 C3D_Tex */
-static int convert_texture(TexCacheEntry *e) {
+/* fill an already-allocated C3D_Tex from the (indexed/16-bit) source */
+static int convert_texture_into(TexCacheEntry *e) {
     int w = e->w, h = e->h;
-
-    if (!C3D_TexInit(&e->tex, (u16)w, (u16)h, GPU_RGBA5551)) {
-        debug_print("gu_draw: C3D_TexInit %dx%d FAILED", w, h);
-        return 0;
-    }
-    C3D_TexSetFilter(&e->tex, GPU_NEAREST, GPU_NEAREST);
-    C3D_TexSetWrap(&e->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
 
     const uint8_t *src = (const uint8_t *)e->tex_ptr;
     uint8_t *linear = NULL;
@@ -206,6 +226,25 @@ static int convert_texture(TexCacheEntry *e) {
     return 1;
 }
 
+/* allocate + fill a native texture for a cache entry */
+static int convert_texture(TexCacheEntry *e) {
+    if (!C3D_TexInit(&e->tex, (u16)e->w, (u16)e->h, GPU_RGBA5551)) {
+        debug_print("gu_draw: C3D_TexInit %dx%d FAILED", e->w, e->h);
+        return 0;
+    }
+    C3D_TexSetFilter(&e->tex, GPU_NEAREST, GPU_NEAREST);
+    C3D_TexSetWrap(&e->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+
+    e->data_sum = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
+    e->check_frame = s_frame_id;
+
+    if (!convert_texture_into(e)) {
+        C3D_TexDelete(&e->tex);
+        return 0;
+    }
+    return 1;
+}
+
 static TexCacheEntry *resolve_texture(void) {
     if (!s_gu.tex_ptr)
         return NULL;
@@ -220,6 +259,21 @@ static TexCacheEntry *resolve_texture(void) {
         TexCacheEntry *e = &s_cache[i];
         if (e->valid && e->tex_ptr == s_gu.tex_ptr && e->clut_ptr == s_gu.clut_ptr && e->clut_sum == sum &&
             e->w == s_gu.tex_w && e->h == s_gu.tex_h && e->format == s_gu.format && e->swizzled == s_gu.swizzled) {
+            /* melt writers notify us directly (data_sum forced stale);
+             * the periodic checksum is only a safety net for writers we
+             * haven't hooked */
+            if (e->data_sum == 0xDEADD1A7 || s_frame_id - e->check_frame >= 30) {
+                e->check_frame = s_frame_id;
+                uint32_t ds = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
+                if (ds != e->data_sum) {
+                    e->data_sum = ds;
+                    if (!convert_texture_into(e)) {
+                        C3D_TexDelete(&e->tex);
+                        e->valid = 0;
+                        return NULL;
+                    }
+                }
+            }
             e->last_use = ++s_use_counter;
             return e;
         }
