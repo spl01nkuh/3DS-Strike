@@ -355,19 +355,5 @@ void *sceGuGetMemory(int size) {
 
 void pspshim_gu_frame_reset(void) { s_gu_scratch_off = 0; }
 
-void sceGuDrawArray(int prim, int vtype, int count, const void *indices, const void *vertices) {
-    (void)prim; (void)vtype; (void)count; (void)indices; (void)vertices;
-}
-void sceGuTexImage(int mipmap, int width, int height, int tbw, const void *tbp) {
-    (void)mipmap; (void)width; (void)height; (void)tbw; (void)tbp;
-}
-void sceGuTexMode(int tpsm, int maxmips, int a2, int swizzle) { (void)tpsm; (void)maxmips; (void)a2; (void)swizzle; }
-void sceGuTexWrap(int u, int v) { (void)u; (void)v; }
-void sceGuTexFilter(int min, int mag) { (void)min; (void)mag; }
-void sceGuTexFunc(int tfx, int tcc) { (void)tfx; (void)tcc; }
-void sceGuClutMode(unsigned int cpsm, unsigned int shift, unsigned int mask, unsigned int a3) {
-    (void)cpsm; (void)shift; (void)mask; (void)a3;
-}
-void sceGuClutLoad(int num_blocks, const void *cbp) { (void)num_blocks; (void)cbp; }
-void sceGuEnable(int state) { (void)state; }
-void sceGuDisable(int state) { (void)state; }
+/* Remaining sceGu* entry points (TexImage/ClutLoad/DrawArray/...) are
+ * implemented by the renderer in src/ctr/gu_draw.c. */

@@ -74,7 +74,7 @@ target_include_directories(${PROJECT_NAME} PRIVATE
     include/sf33rd/Source/PS2/cseDataFiles
 )
 
-target_link_libraries(${PROJECT_NAME} PRIVATE citro3d ctru m)
+target_link_libraries(${PROJECT_NAME} PRIVATE citro2d citro3d ctru m)
 
 set(DISABLED_WARNINGS
     -Wno-unused-but-set-variable

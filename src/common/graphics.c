@@ -1,21 +1,18 @@
-/* graphics.c — citro3d implementation of the frame lifecycle for 3DS.
+/* graphics.c — citro2d/citro3d frame lifecycle for the 3DS port.
  *
- * Contract preserved from the PSP version:
- *  - startFrame(): present-sync, apply render_mode scaling globals
- *    (Scale_Factor/Off, Min/Max clip bounds, Fade_Pos_tbl), clear.
- *  - endFrame()/endFrameDebug(): finish the frame.
- *  - The decompiled game reads Min_X/Max_X/Min_Y/Max_Y and uses
- *    SCALE_X/SCALE_Y everywhere, so setupScaling stays (pure C, no VFPU).
- *
- * The actual draw calls arrive through the GU-translation layer
- * (sceGuDrawArray & friends) which is wired to citro3d in the video
- * backend; this file owns targets, projection, and frame begin/end.
+ * Contract preserved from the PSP version: startFrame applies the
+ * render_mode scaling globals (Scale_Factor/Off, Min/Max clip bounds,
+ * Fade_Pos_tbl) that the decompiled game reads directly, then opens the
+ * frame; endFrame presents. Draws flow through src/ctr/gu_draw.c.
  */
 #include "graphics.h"
 #include "sprites.h"
 
 #include <3ds.h>
+#include <citro2d.h>
 #include <citro3d.h>
+
+#include "ctr/gu_draw.h"
 
 // just for this project
 #include "Game/WORK_SYS.h"
@@ -51,14 +48,9 @@ float Scale_Off_Y = 0.0f;
 static int RTT_Enabled_temp = -1;
 static int Scaling_mode_temp = -1;
 
-/* --- citro3d state --- */
+/* --- citro2d state --- */
 static C3D_RenderTarget *s_top_target;
-static C3D_Mtx s_projection;
 static int s_in_frame = 0;
-
-/* exposed for the GU translation layer (video backend) */
-C3D_Mtx *ctrGetProjection(void) { return &s_projection; }
-int ctrInFrame(void) { return s_in_frame; }
 
 void setupScaling(int mode) {
     if (RTT_Enabled_temp == RTT_Enabled && Scaling_mode_temp == mode)
@@ -95,7 +87,7 @@ void setupScaling(int mode) {
     default:
         Scale_Factor_X = 1.0f;
         Scale_Factor_Y = 1.0f;
-        Scale_Off_X = (SCREEN_WIDTH - CPS3_WIDTH) / 2.0f;  /* 8 */
+        Scale_Off_X = (SCREEN_WIDTH - CPS3_WIDTH) / 2.0f;   /* 8 */
         Scale_Off_Y = (SCREEN_HEIGHT - CPS3_HEIGHT) / 2.0f; /* 8 */
 
         Min_X = 0.0f;
@@ -123,18 +115,12 @@ void initGu() {
     gfxSet3D(false);
 
     C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+    C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
+    C2D_Prepare();
 
-    /* Top screen color target. The 3DS framebuffer is physically rotated:
-       a "400x240" screen is a 240x400 buffer. C3D_RenderTargetCreate takes
-       (height, width) in that physical orientation. */
-    s_top_target = C3D_RenderTargetCreate(240, 400, GPU_RB_RGBA8, GPU_RB_DEPTH16);
-    C3D_RenderTargetSetOutput(s_top_target, GFX_TOP, GFX_LEFT,
-                              GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) |
-                                  GX_TRANSFER_RAW_COPY(0) | GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) |
-                                  GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) | GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
+    s_top_target = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
 
-    /* 2D orthographic projection in screen coordinates (0,0 top-left). */
-    Mtx_OrthoTilt(&s_projection, 0.0f, SCREEN_WIDTH, SCREEN_HEIGHT, 0.0f, 0.0f, 1.0f, true);
+    ctrGuInit();
 
     my_gu_init = 1;
 }
@@ -142,27 +128,25 @@ void initGu() {
 void endGu() {
     if (!my_gu_init)
         return;
+    C2D_Fini();
     C3D_Fini();
     gfxExit();
     my_gu_init = 0;
 }
 
-static u32 bgr_clear_color(uint32_t argb) {
-    /* game color is ABGR-ish via fixARGB; clear wants RGBA8 */
-    u32 a = (argb >> 24) & 0xFF;
-    u32 b = (argb >> 16) & 0xFF;
-    u32 g = (argb >> 8) & 0xFF;
-    u32 r = argb & 0xFF;
-    return (r << 24) | (g << 16) | (b << 8) | a;
+static u32 abgr_to_c2d(uint32_t c) {
+    /* game colors arrive as ABGR8888 which matches C2D's u32 layout */
+    return c;
 }
 
 void startFrame() {
     setupScaling(render_mode);
     pspshim_gu_frame_reset();
+    ctrGuFrameBegin();
 
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-    C3D_RenderTargetClear(s_top_target, C3D_CLEAR_ALL, bgr_clear_color(bg_color), 0);
-    C3D_FrameDrawOn(s_top_target);
+    C2D_TargetClear(s_top_target, abgr_to_c2d(bg_color));
+    C2D_SceneBegin(s_top_target);
     s_in_frame = 1;
 
     ppgResetTextureCache();
