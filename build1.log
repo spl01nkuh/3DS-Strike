@@ -1,3 +1,16 @@
-[1/3] Building C object CMakeFiles/3rd-strike.dir/src/ctr/gu_draw.o
+[1/3] Building C object CMakeFiles/3rd-strike.dir/src/ctr/audio.o
+C:/dev/sf3/3s-3ds/src/ctr/audio.c: In function 'pspAudioSetVolume':
+C:/dev/sf3/3s-3ds/src/ctr/audio.c:216:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  216 |     if (left < 0) left = 0; if (left > PSP_VOLUME_MAX) left = PSP_VOLUME_MAX;
+      |     ^~
+C:/dev/sf3/3s-3ds/src/ctr/audio.c:216:29: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  216 |     if (left < 0) left = 0; if (left > PSP_VOLUME_MAX) left = PSP_VOLUME_MAX;
+      |                             ^~
+C:/dev/sf3/3s-3ds/src/ctr/audio.c:217:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  217 |     if (right < 0) right = 0; if (right > PSP_VOLUME_MAX) right = PSP_VOLUME_MAX;
+      |     ^~
+C:/dev/sf3/3s-3ds/src/ctr/audio.c:217:31: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  217 |     if (right < 0) right = 0; if (right > PSP_VOLUME_MAX) right = PSP_VOLUME_MAX;
+      |                               ^~
 [2/3] Linking C executable 3rd-strike.elf
 [3/3] Building 3DSX executable target 3rd-strike_3dsx

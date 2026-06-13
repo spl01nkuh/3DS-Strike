@@ -316,28 +316,7 @@ int scePowerSetClockFrequency(int cpufreq, int ramfreq, int busfreq) {
     return 0;
 }
 
-/* ------------------------------------------------------ audio (stubs) -- */
-/* Real output path lands in the ndsp backend (task: audio). These keep
- * adx.c/spu.c linking and silently swallow output until then. */
-
-int sceAudioChReserve(int channel, int samplecount, int format) {
-    (void)samplecount; (void)format;
-    return (channel == PSP_AUDIO_NEXT_CHANNEL) ? 0 : channel;
-}
-int sceAudioChRelease(int channel) { (void)channel; return 0; }
-int sceAudioOutputBlocking(int channel, int vol, void *buf) {
-    (void)channel; (void)vol; (void)buf;
-    /* block roughly like real output would, so streaming threads pace */
-    svcSleepThread(10 * 1000 * 1000LL);
-    return 0;
-}
-
-int pspAudioInit(void) { return 0; }
-void pspAudioEnd(void) {}
-void pspAudioSetChannelCallback(int channel, pspAudioCallback_t callback, void *pdata) {
-    (void)channel; (void)callback; (void)pdata;
-}
-void pspAudioSetVolume(int channel, int left, int right) { (void)channel; (void)left; (void)right; }
+/* audio: implemented in src/ctr/audio.c (ndsp backend) */
 
 /* -------------------------------------------------------- GU residual -- */
 
