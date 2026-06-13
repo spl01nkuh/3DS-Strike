@@ -204,11 +204,17 @@ int pspAudioInit(void) {
     for (int i = 0; i < NUM_WBUF; i++)
         queue_buffer(i);
 
-    /* Audio thread runs slightly above main; default core (Old-3DS core
-     * pinning is revisited in the perf pass). */
+    /* Pin the mixer to the system core (1) so the SPU2 tick + ADX decode
+     * run parallel to the render thread on core 0 instead of stealing its
+     * time — recovers the ~2fps the audio work was costing. Falls back to
+     * the default core if core 1 is unavailable. Priority just above main. */
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    s_thread = threadCreate(audio_thread, NULL, 16 * 1024, prio - 1, -1, false);
+    s_thread = threadCreate(audio_thread, NULL, 16 * 1024, prio - 1, 1, false);
+    if (!s_thread) {
+        debug_print("audio: core-1 thread create failed; retrying default core");
+        s_thread = threadCreate(audio_thread, NULL, 16 * 1024, prio - 1, -1, false);
+    }
     if (!s_thread)
         debug_print("audio: thread create failed (DSP will underrun)");
 

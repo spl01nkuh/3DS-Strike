@@ -55,6 +55,13 @@ static TexCacheEntry s_cache[TEXCACHE_SIZE];
 static uint32_t s_use_counter;
 static C2D_ImageTint s_tint;
 
+/* Value LUTs for direct 16-bit formats: the PS2->PICA channel swap is a pure
+ * function of the pixel value (palette-independent), so a one-time 64Ki-entry
+ * table turns per-pixel bit math into a single load. Built lazily on first
+ * direct-format conversion. 256KB total — negligible vs the RAM budget. */
+static uint16_t *s_lut5551;
+static uint16_t *s_lut4444;
+
 void ctrGuInit(void) {
     memset(&s_gu, 0, sizeof(s_gu));
     memset(s_cache, 0, sizeof(s_cache));
@@ -64,14 +71,52 @@ void ctrGuInit(void) {
 
 static uint32_t s_frame_id;
 
+/* --- lightweight profiler (GU_PROFILE) --------------------------------- */
+#define GU_PROFILE 1
+#if GU_PROFILE
+static uint32_t prof_frames;
+static uint32_t prof_conv, prof_rows, prof_quads, prof_csum, prof_misses;
+static uint64_t prof_conv_ticks, prof_csum_ticks;
+static uint32_t prof_fmt[8];      /* conversions per GU_PSM_* */
+static uint32_t prof_dim_w, prof_dim_h; /* last converted dims */
+#define PROF_ADD(var, n) (prof_##var += (n))
+#define PROF_TICK_START() uint64_t _t0 = svcGetSystemTick()
+#define PROF_TICK_END(acc) (prof_##acc += svcGetSystemTick() - _t0)
+#else
+#define PROF_ADD(var, n) ((void)0)
+#define PROF_TICK_START() ((void)0)
+#define PROF_TICK_END(acc) ((void)0)
+#endif
+
 void ctrGuFrameBegin(void) {
     /* Dynamic sheets (texcash melts) are detected by content checksum at
      * first bind each frame — see resolve_texture.
      * TODO(old-3ds): replace checksums with dirty hooks in the melt path. */
     s_frame_id++;
+#if GU_PROFILE
+    if (++prof_frames >= 60) {
+        uint64_t cps = (uint64_t)CPU_TICKS_PER_USEC;
+        debug_print("prof/60f: conv=%lu rows=%lu (%lu us)  csum=%lu (%lu us)  quads=%lu  miss=%lu",
+                    (unsigned long)prof_conv, (unsigned long)prof_rows,
+                    (unsigned long)(prof_conv_ticks / cps), (unsigned long)prof_csum,
+                    (unsigned long)(prof_csum_ticks / cps), (unsigned long)prof_quads,
+                    (unsigned long)prof_misses);
+        if (prof_conv)
+            debug_print("   fmt T4=%lu T8=%lu 5551=%lu 4444=%lu 8888=%lu other=%lu  last=%lux%lu",
+                        (unsigned long)prof_fmt[GU_PSM_T4], (unsigned long)prof_fmt[GU_PSM_T8],
+                        (unsigned long)prof_fmt[GU_PSM_5551], (unsigned long)prof_fmt[GU_PSM_4444],
+                        (unsigned long)prof_fmt[GU_PSM_8888],
+                        (unsigned long)(prof_fmt[0] + prof_fmt[GU_PSM_T16]),
+                        (unsigned long)prof_dim_w, (unsigned long)prof_dim_h);
+        prof_frames = prof_conv = prof_rows = prof_quads = prof_csum = prof_misses = 0;
+        prof_conv_ticks = prof_csum_ticks = 0;
+        memset(prof_fmt, 0, sizeof(prof_fmt));
+    }
+#endif
 }
 
 static uint32_t data_checksum(const void *p, size_t bytes) {
+    PROF_TICK_START();
     const uint32_t *u = (const uint32_t *)p;
     size_t n = bytes / 4;
     uint32_t a = 0, b = 0;
@@ -79,6 +124,8 @@ static uint32_t data_checksum(const void *p, size_t bytes) {
         a ^= u[i];
         b += u[i];
     }
+    PROF_ADD(csum, 1);
+    PROF_TICK_END(csum_ticks);
     return a ^ (b << 1);
 }
 
@@ -130,22 +177,22 @@ static uint32_t clut_checksum(const uint16_t *pal, int count) {
     return sum;
 }
 
-/* Source 5551 is PS2-ordered: B in bits 0-4, G 5-9, R 10-14, A bit 15
- * (the PSP port R/B-swapped this at load; we decode it directly).
- * Target PICA RGB5A1: R5 G5 B5 A1 from MSB. */
+/* Source is PS2 PSMCT16: R in bits 0-4, G 5-9, B 10-14, A bit 15.
+ * Target PICA RGBA5551: R5 G5 B5 A1 from MSB. (No R/B swap — the earlier
+ * swap produced inverted colors.) */
 static inline uint16_t conv5551(uint16_t c) {
-    uint16_t b = c & 0x1F;
+    uint16_t r = c & 0x1F;
     uint16_t g = (c >> 5) & 0x1F;
-    uint16_t r = (c >> 10) & 0x1F;
+    uint16_t b = (c >> 10) & 0x1F;
     uint16_t a = (c >> 15) & 1;
     return (uint16_t)((r << 11) | (g << 6) | (b << 1) | a);
 }
 
-/* Source 4444 (PS2 order, B nibble low) → RGB5A1 with 4→5 bit expand */
+/* Source 4444 (PS2 order, R nibble low) → RGB5A1 with 4->5 bit expand */
 static inline uint16_t conv4444(uint16_t c) {
-    uint16_t b = c & 0xF;
+    uint16_t r = c & 0xF;
     uint16_t g = (c >> 4) & 0xF;
-    uint16_t r = (c >> 8) & 0xF;
+    uint16_t b = (c >> 8) & 0xF;
     uint16_t a = (c >> 12) ? 1 : 0;
     r = (r << 1) | (r >> 3);
     g = (g << 1) | (g >> 3);
@@ -173,11 +220,18 @@ static void psp_unswizzle(uint8_t *out, const uint8_t *in, uint32_t width_bytes,
 }
 
 /* fill rows [y0, y1) of an already-allocated C3D_Tex from the source */
-static int convert_texture_into(TexCacheEntry *e, int y0, int y1) {
+static int convert_texture_into_impl(TexCacheEntry *e, int y0, int y1) {
     int w = e->w, h = e->h;
 
     if (y0 < 0) y0 = 0;
     if (y1 > h) y1 = h;
+
+    PROF_ADD(conv, 1);
+    PROF_ADD(rows, y1 - y0);
+#if GU_PROFILE
+    prof_fmt[e->format & 7]++;
+    prof_dim_w = w; prof_dim_h = h;
+#endif
 
     const uint8_t *src = (const uint8_t *)e->tex_ptr;
     uint8_t *linear = NULL;
@@ -210,60 +264,81 @@ static int convert_texture_into(TexCacheEntry *e, int y0, int y1) {
             pal5551[i] = conv5551(pal[i]);
     }
 
+    /* Precomputed Morton offsets within an 8x8 tile: off(x,y) inside a tile
+     * = mx[x&7] + my[y&7]. Hoisting these out of the per-pixel loop replaces
+     * two morton7() calls per texel with two array reads. Within a tile,
+     * even x and x+1 map to adjacent offsets, enabling 2-texel u32 stores. */
+    static const uint16_t mx[8] = {0, 1, 4, 5, 16, 17, 20, 21};
+    static const uint16_t my[8] = {0, 2, 8, 10, 32, 34, 40, 42};
+    uint32_t tiles_w = (uint32_t)w >> 3;
+
     if (e->format == GU_PSM_T4 && pal) {
-        /* hot path: two texels per source byte; horizontally adjacent
-         * texels are consecutive u16s inside a Morton tile, so a 256-entry
-         * pair-LUT lets us emit both with one u32 store */
+        /* two texels per source byte → one u32 store via pair-LUT */
         uint32_t lut[256];
         for (int b = 0; b < 256; b++)
             lut[b] = (uint32_t)pal5551[b & 0xF] | ((uint32_t)pal5551[b >> 4] << 16);
         uint32_t *dst32 = (uint32_t *)dst;
         for (int y = y0; y < y1; y++) {
             const uint8_t *row = src + y * row_bytes;
-            uint32_t ybase = ((uint32_t)y >> 3) * ((uint32_t)w >> 3) * 64;
-            uint32_t ym = morton7(0, (uint32_t)y & 7);
+            uint32_t ybase = ((uint32_t)y >> 3) * tiles_w * 64 + my[y & 7];
             for (int x = 0; x < w; x += 2) {
-                uint32_t off = ybase + (((uint32_t)x >> 3) * 64 | ym | morton7((uint32_t)x & 7, 0));
+                uint32_t off = ybase + ((uint32_t)x >> 3) * 64 + mx[x & 7];
                 dst32[off >> 1] = lut[row[x >> 1]];
             }
         }
-        free(linear);
-        C3D_TexFlush(&e->tex);
-        return 1;
-    }
-
-    for (int y = y0; y < y1; y++) {
-        const uint8_t *row = src + y * row_bytes;
-        for (int x = 0; x < w; x++) {
-            uint16_t out;
-            switch (e->format) {
-            case GU_PSM_T4: {
-                uint8_t b = row[x >> 1];
-                uint8_t idx = (x & 1) ? (b >> 4) : (b & 0xF);
-                out = pal ? pal5551[idx] : 0;
-                break;
+    } else if (e->format == GU_PSM_T8 && pal) {
+        /* two independent bytes → combine into one u32 store */
+        uint32_t *dst32 = (uint32_t *)dst;
+        for (int y = y0; y < y1; y++) {
+            const uint8_t *row = src + y * row_bytes;
+            uint32_t ybase = ((uint32_t)y >> 3) * tiles_w * 64 + my[y & 7];
+            for (int x = 0; x < w; x += 2) {
+                uint32_t off = ybase + ((uint32_t)x >> 3) * 64 + mx[x & 7];
+                dst32[off >> 1] = (uint32_t)pal5551[row[x]] | ((uint32_t)pal5551[row[x + 1]] << 16);
             }
-            case GU_PSM_T8:
-                out = pal ? pal5551[row[x]] : 0;
-                break;
-            case GU_PSM_4444:
-                out = conv4444(((const uint16_t *)row)[x]);
-                break;
-            case GU_PSM_5551:
-            default:
-                out = conv5551(((const uint16_t *)row)[x]);
-                break;
+        }
+    } else {
+        /* direct 16-bit formats (5551/4444) — value-LUT + pair store */
+        int is4444 = (e->format == GU_PSM_4444);
+        if (!s_lut5551 || !s_lut4444) {
+            s_lut5551 = (uint16_t *)malloc(65536 * sizeof(uint16_t));
+            s_lut4444 = (uint16_t *)malloc(65536 * sizeof(uint16_t));
+            if (s_lut5551 && s_lut4444)
+                for (int v = 0; v < 65536; v++) {
+                    s_lut5551[v] = conv5551((uint16_t)v);
+                    s_lut4444[v] = conv4444((uint16_t)v);
+                }
+        }
+        const uint16_t *lut = is4444 ? s_lut4444 : s_lut5551;
+        uint32_t *dst32 = (uint32_t *)dst;
+        for (int y = y0; y < y1; y++) {
+            const uint16_t *row16 = (const uint16_t *)(src + y * row_bytes);
+            uint32_t ybase = ((uint32_t)y >> 3) * tiles_w * 64 + my[y & 7];
+            if (lut) {
+                for (int x = 0; x < w; x += 2) {
+                    uint32_t off = ybase + ((uint32_t)x >> 3) * 64 + mx[x & 7];
+                    dst32[off >> 1] = (uint32_t)lut[row16[x]] | ((uint32_t)lut[row16[x + 1]] << 16);
+                }
+            } else { /* alloc failed — slow but correct */
+                for (int x = 0; x < w; x++) {
+                    uint32_t off = ybase + ((uint32_t)x >> 3) * 64 + mx[x & 7];
+                    dst[off] = is4444 ? conv4444(row16[x]) : conv5551(row16[x]);
+                }
             }
-            /* store top-down; paired with the inverted subtex in
-             * ctrGuDrawTexQuad this samples upright (PICA v=0 = first row) */
-            uint32_t off = ((y >> 3) * (w >> 3) + (x >> 3)) * 64 + morton7(x & 7, (uint32_t)y & 7);
-            dst[off] = out;
         }
     }
 
     free(linear);
     C3D_TexFlush(&e->tex);
     return 1;
+}
+
+/* timing wrapper around the (multi-exit) converter */
+static int convert_texture_into(TexCacheEntry *e, int y0, int y1) {
+    PROF_TICK_START();
+    int r = convert_texture_into_impl(e, y0, y1);
+    PROF_TICK_END(conv_ticks);
+    return r;
 }
 
 /* allocate (or reuse) + fill a native texture for a cache entry */
@@ -365,6 +440,7 @@ static TexCacheEntry *resolve_texture(void) {
     }
 
     /* miss — evict lru, keeping its GPU allocation when dims match */
+    PROF_ADD(misses, 1);
     if (lru->valid) {
         lru->valid = 0;
         if (lru->tex_alive && (lru->w != s_gu.tex_w || lru->h != s_gu.tex_h)) {
@@ -396,6 +472,7 @@ void ctrGuDrawTexQuad(float x1, float y1, float u1, float v1, float x2, float y2
     TexCacheEntry *e = resolve_texture();
     if (!e)
         return;
+    PROF_ADD(quads, 1);
 
     /* GU accepts corner pairs in any order (mirrored sprites swap them);
      * C2D needs a positive-size dest rect, so normalize and mirror UVs. */
