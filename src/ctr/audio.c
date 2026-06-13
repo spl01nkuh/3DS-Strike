@@ -19,6 +19,7 @@
 #include <pspshim.h>
 
 #include <3ds.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -117,6 +118,38 @@ static void audio_thread(void *arg) {
     }
 }
 
+/* libctru's ndspInit normally locates the DSP firmware via the system,
+ * which fails under Citra/Azahar HLE (and on any console where it isn't
+ * exposed). Loading dspfirm.cdc ourselves and handing it to libctru via
+ * ndspUseComponent() satisfies that step on both emulator and hardware. */
+static void *s_dspfirm;
+static int load_dsp_firmware(void) {
+    static const char *paths[] = {
+        "sdmc:/3ds/sf3/dspfirm.cdc",
+        "sdmc:/3ds/dspfirm.cdc",
+        "romfs:/dspfirm.cdc",
+    };
+    for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+        FILE *f = fopen(paths[i], "rb");
+        if (!f)
+            continue;
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (sz <= 0) { fclose(f); continue; }
+        s_dspfirm = malloc(sz);
+        if (!s_dspfirm) { fclose(f); return 0; }
+        size_t rd = fread(s_dspfirm, 1, sz, f);
+        fclose(f);
+        if (rd != (size_t)sz) { free(s_dspfirm); s_dspfirm = NULL; continue; }
+        ndspUseComponent(s_dspfirm, sz, 0xFFFF, 0xFFFF);
+        debug_print("audio: loaded DSP firmware %s (%ld bytes)", paths[i], sz);
+        return 1;
+    }
+    debug_print("audio: dspfirm.cdc not found on SD — ndsp may fail");
+    return 0;
+}
+
 int pspAudioInit(void) {
     if (s_inited)
         return 0;
@@ -128,6 +161,7 @@ int pspAudioInit(void) {
         s_chan[i].vol_r = PSP_VOLUME_MAX;
     }
 
+    load_dsp_firmware();
     Result ndsp_rc = ndspInit();
     if (R_FAILED(ndsp_rc)) {
         /* No DSP firmware (real HW without dump) — run silent. */
