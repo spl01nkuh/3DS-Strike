@@ -33,7 +33,9 @@ static GuState s_gu;
 
 /* ------------------------------------------------------ texture cache -- */
 
-#define TEXCACHE_SIZE 48
+#define TEXCACHE_SIZE 64 /* must hold all (sheet,palette) variants of a busy
+                          * scene (char select) so they coexist instead of
+                          * thrashing — see resolve_texture pal_reuse note */
 
 typedef struct {
     const void *tex_ptr;
@@ -79,6 +81,7 @@ static uint32_t prof_conv, prof_rows, prof_quads, prof_csum, prof_misses;
 static uint64_t prof_conv_ticks, prof_csum_ticks;
 static uint32_t prof_fmt[8];      /* conversions per GU_PSM_* */
 static uint32_t prof_dim_w, prof_dim_h; /* last converted dims */
+static uint64_t prof_frame_ticks, prof_frame_max, prof_last_tick; /* total frame period */
 #define PROF_ADD(var, n) (prof_##var += (n))
 #define PROF_TICK_START() uint64_t _t0 = svcGetSystemTick()
 #define PROF_TICK_END(acc) (prof_##acc += svcGetSystemTick() - _t0)
@@ -94,9 +97,19 @@ void ctrGuFrameBegin(void) {
      * TODO(old-3ds): replace checksums with dirty hooks in the melt path. */
     s_frame_id++;
 #if GU_PROFILE
+    {
+        uint64_t now = svcGetSystemTick();
+        if (prof_last_tick) {
+            uint64_t dt = now - prof_last_tick;
+            prof_frame_ticks += dt;
+            if (dt > prof_frame_max) prof_frame_max = dt;
+        }
+        prof_last_tick = now;
+    }
     if (++prof_frames >= 60) {
         uint64_t cps = (uint64_t)CPU_TICKS_PER_USEC;
-        debug_print("prof/60f: conv=%lu rows=%lu (%lu us)  csum=%lu (%lu us)  quads=%lu  miss=%lu",
+        debug_print("prof/60f: FRAME avg=%lu us max=%lu us | conv=%lu rows=%lu (%lu us)  csum=%lu (%lu us)  quads=%lu  miss=%lu",
+                    (unsigned long)(prof_frame_ticks / cps / 60), (unsigned long)(prof_frame_max / cps),
                     (unsigned long)prof_conv, (unsigned long)prof_rows,
                     (unsigned long)(prof_conv_ticks / cps), (unsigned long)prof_csum,
                     (unsigned long)(prof_csum_ticks / cps), (unsigned long)prof_quads,
@@ -110,6 +123,7 @@ void ctrGuFrameBegin(void) {
                         (unsigned long)prof_dim_w, (unsigned long)prof_dim_h);
         prof_frames = prof_conv = prof_rows = prof_quads = prof_csum = prof_misses = 0;
         prof_conv_ticks = prof_csum_ticks = 0;
+        prof_frame_ticks = prof_frame_max = 0;
         memset(prof_fmt, 0, sizeof(prof_fmt));
     }
 #endif
@@ -399,7 +413,10 @@ static TexCacheEntry *resolve_texture(void) {
                 convert_texture_into(e, y0, y1);
                 e->data_sum = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
                 e->check_frame = s_frame_id;
-            } else if (s_frame_id - e->check_frame >= 30) {
+            } else if (s_frame_id - e->check_frame >= 240) {
+                /* rare safety net for writers we haven't hooked; the melt
+                 * hooks (dirty_min/max) handle the common dynamic case, so
+                 * full-sheet revalidation can be infrequent */
                 e->check_frame = s_frame_id;
                 uint32_t ds = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
                 if (ds != e->data_sum) {
@@ -418,25 +435,27 @@ static TexCacheEntry *resolve_texture(void) {
             lru = e;
     }
 
-    /* never evict a texture already referenced by this frame's deferred
-     * draws — the GPU reads it at frame end */
-    if (lru->valid && lru->drawn_frame == s_frame_id)
-        return NULL;
-
-    /* palette-cycling fast path: same pixels under a new palette — reuse
-     * the entry and reconvert in place instead of evicting other textures */
-    if (pal_reuse) {
-        pal_reuse->clut_ptr = s_gu.clut_ptr;
-        pal_reuse->clut_sum = sum;
-        pal_reuse->dirty_min = 1;
-        pal_reuse->dirty_max = 0;
-        if (!convert_texture_into(pal_reuse, 0, pal_reuse->h)) {
-            pal_reuse->valid = 0;
-            return NULL;
+    /* If the best eviction candidate is still needed by this frame's
+     * deferred draws, we can't make a new entry. Only THEN fall back to
+     * reconverting a same-sheet palette variant in place. Doing this as a
+     * last resort (not preferentially) lets P1/P2 palette variants of the
+     * same sheet COEXIST as separate cached entries — otherwise they
+     * ping-pong, reconverting hundreds of times per frame. */
+    if (lru->valid && lru->drawn_frame == s_frame_id) {
+        if (pal_reuse) {
+            pal_reuse->clut_ptr = s_gu.clut_ptr;
+            pal_reuse->clut_sum = sum;
+            pal_reuse->dirty_min = 1;
+            pal_reuse->dirty_max = 0;
+            if (!convert_texture_into(pal_reuse, 0, pal_reuse->h)) {
+                pal_reuse->valid = 0;
+                return NULL;
+            }
+            pal_reuse->last_use = ++s_use_counter;
+            pal_reuse->drawn_frame = s_frame_id;
+            return pal_reuse;
         }
-        pal_reuse->last_use = ++s_use_counter;
-        pal_reuse->drawn_frame = s_frame_id;
-        return pal_reuse;
+        return NULL; /* genuinely out of slots this frame */
     }
 
     /* miss — evict lru, keeping its GPU allocation when dims match */
