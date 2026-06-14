@@ -360,8 +360,14 @@ static int convert_texture_into_impl(TexCacheEntry *e, int y0, int y1) {
 
     int pal_count = (e->format == GU_PSM_T4) ? 16 : 256;
     if (pal) {
-        for (int i = 0; i < pal_count; i++)
-            pal5551[i] = conv5551(pal[i]);
+        /* CPS3 colorkey: index 0 is transparent (keep its palette alpha so
+         * sprite backgrounds stay clear and opaque bg tiles stay opaque);
+         * EVERY other index is a visible color and must be opaque. Without
+         * forcing this, palette entries whose alpha bit is unset get
+         * discarded by the alpha test, breaking up text/glyphs. */
+        pal5551[0] = conv5551(pal[0]);
+        for (int i = 1; i < pal_count; i++)
+            pal5551[i] = conv5551(pal[i]) | 1u; /* alpha = bit 0 in RGBA5551 */
     }
 
     /* Precomputed Morton offsets within an 8x8 tile: off(x,y) inside a tile
