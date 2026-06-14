@@ -91,11 +91,43 @@ static uint64_t prof_frame_ticks, prof_frame_max, prof_last_tick; /* total frame
 #define PROF_TICK_END(acc) ((void)0)
 #endif
 
+/* --- depth ordering -----------------------------------------------------
+ * The game gives every sprite a Z/priority (PS2/PSP depth-tested GU_LEQUAL,
+ * small z = front). citro2d depth-tests GEQUAL (higher depth = on top) and
+ * clears depth to 0 via C2D_TargetClear. We map the game's z so that the
+ * frontmost (smallest z) gets the highest C2D depth. The z range is unknown
+ * and scene-dependent, so we self-normalize using the PREVIOUS frame's
+ * observed [min,max] (stable frame-to-frame) and accumulate the current
+ * frame's range as we draw. Applied uniformly to every path so fades and
+ * masks land in their correct layer just like on hardware. */
+static float s_zmin, s_zmax;             /* previous frame range (for mapping) */
+static float s_zmin_cur = 1e30f, s_zmax_cur = -1e30f; /* this frame, accumulating */
+static float s_quad_z;                   /* z for the next ctrGuDrawTexQuad */
+static int s_quad_z_set;                 /* 0 => caller is an overlay (draw on top) */
+
+static float map_depth(float z) {
+    if (z < s_zmin_cur) s_zmin_cur = z;
+    if (z > s_zmax_cur) s_zmax_cur = z;
+    float range = s_zmax - s_zmin;
+    if (range < 1e-6f)
+        return 0.5f; /* unknown/flat range -> rely on submission order */
+    float t = (s_zmax - z) / range; /* small z (front) -> ~1.0 */
+    if (t < 0.0f) t = 0.0f;
+    if (t > 1.0f) t = 1.0f;
+    return t;
+}
+
 void ctrGuFrameBegin(void) {
     /* Dynamic sheets (texcash melts) are detected by content checksum at
      * first bind each frame — see resolve_texture.
      * TODO(old-3ds): replace checksums with dirty hooks in the melt path. */
     s_frame_id++;
+
+    /* commit the range observed last frame, reset the accumulator */
+    s_zmin = s_zmin_cur;
+    s_zmax = s_zmax_cur;
+    s_zmin_cur = 1e30f;
+    s_zmax_cur = -1e30f;
 #if GU_PROFILE
     {
         uint64_t now = svcGetSystemTick();
@@ -523,14 +555,18 @@ void ctrGuDrawTexQuad(float x1, float y1, float u1, float v1, float x2, float y2
     params.pos.y = y1;
     params.pos.w = x2 - x1;
     params.pos.h = y2 - y1;
-    params.depth = 0.0f;
+    /* game sprites use their mapped z; direct overlay callers (sprites.c)
+     * don't set one and draw on top */
+    params.depth = s_quad_z_set ? map_depth(s_quad_z) : 0.95f;
+    s_quad_z_set = 0;
 
     C2D_PlainImageTint(&s_tint, color, 1.0f);
     C2D_DrawImage(img, &params, &s_tint);
 }
 
 void ctrGuDrawRectSolid(float x, float y, float w, float h, uint32_t color) {
-    C2D_DrawRectSolid(x, y, 0.0f, w, h, color);
+    /* overlay helper (menu/debug) — draw on top */
+    C2D_DrawRectSolid(x, y, 0.95f, w, h, color);
 }
 
 /* --------------------------------------------- GU entry points (fl.c) -- */
@@ -598,14 +634,16 @@ void sceGuDrawArray(int prim, int vtype, int count, const void *indices, const v
         const GuTexVertex *v = (const GuTexVertex *)vertices;
         if (s_gu.texture_2d_enabled) {
             for (int i = 0; i + 1 < count; i += 2) {
+                s_quad_z = v[i + 1].z;
+                s_quad_z_set = 1;
                 ctrGuDrawTexQuad(v[i].x, v[i].y, (float)v[i].u, (float)v[i].v,
                                  v[i + 1].x, v[i + 1].y, (float)v[i + 1].u, (float)v[i + 1].v,
                                  v[i + 1].colour);
             }
         } else {
             for (int i = 0; i + 1 < count; i += 2) {
-                C2D_DrawRectSolid(v[i].x, v[i].y, 0.0f, v[i + 1].x - v[i].x, v[i + 1].y - v[i].y,
-                                  v[i + 1].colour);
+                C2D_DrawRectSolid(v[i].x, v[i].y, map_depth(v[i + 1].z), v[i + 1].x - v[i].x,
+                                  v[i + 1].y - v[i].y, v[i + 1].colour);
             }
         }
         return;
@@ -615,6 +653,8 @@ void sceGuDrawArray(int prim, int vtype, int count, const void *indices, const v
         /* ppgWriteQuad: axis-aligned quad as a 4-vertex strip; corners 0 and
          * 3 are the diagonal */
         const GuTexVertex *v = (const GuTexVertex *)vertices;
+        s_quad_z = v[3].z;
+        s_quad_z_set = 1;
         ctrGuDrawTexQuad(v[0].x, v[0].y, (float)v[0].u, (float)v[0].v,
                          v[3].x, v[3].y, (float)v[3].u, (float)v[3].v, v[3].colour);
         return;
@@ -623,7 +663,8 @@ void sceGuDrawArray(int prim, int vtype, int count, const void *indices, const v
     if (prim == GU_SPRITES && vtype == VTYPE_COLOR_TRI) {
         const GuColorVertex *v = (const GuColorVertex *)vertices;
         for (int i = 0; i + 1 < count; i += 2) {
-            C2D_DrawRectSolid(v[i].x, v[i].y, 0.0f, v[i + 1].x - v[i].x, v[i + 1].y - v[i].y, v[i + 1].colour);
+            C2D_DrawRectSolid(v[i].x, v[i].y, map_depth(v[i + 1].z), v[i + 1].x - v[i].x,
+                              v[i + 1].y - v[i].y, v[i + 1].colour);
         }
         return;
     }
@@ -633,7 +674,7 @@ void sceGuDrawArray(int prim, int vtype, int count, const void *indices, const v
         for (int i = 0; i + 2 < count; i += 3) {
             C2D_DrawTriangle(v[i].x, v[i].y, v[i].colour,
                              v[i + 1].x, v[i + 1].y, v[i + 1].colour,
-                             v[i + 2].x, v[i + 2].y, v[i + 2].colour, 0.0f);
+                             v[i + 2].x, v[i + 2].y, v[i + 2].colour, map_depth(v[i].z));
         }
         return;
     }
