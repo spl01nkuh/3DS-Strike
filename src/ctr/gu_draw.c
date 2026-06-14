@@ -83,6 +83,7 @@ static uint32_t prof_conv, prof_rows, prof_quads, prof_csum, prof_misses;
 static uint64_t prof_conv_ticks, prof_csum_ticks;
 static uint32_t prof_fmt[8];      /* conversions per GU_PSM_* */
 static uint32_t prof_dim_w, prof_dim_h; /* last converted dims */
+static uint32_t prof_texsolid, prof_colorspr, prof_colortri; /* draw-path mix */
 static uint64_t prof_frame_ticks, prof_frame_max, prof_last_tick; /* total frame period */
 #define PROF_ADD(var, n) (prof_##var += (n))
 #define PROF_TICK_START() uint64_t _t0 = svcGetSystemTick()
@@ -119,6 +120,52 @@ static float map_depth(float z) {
     return t;
 }
 
+/* --- blend modes --------------------------------------------------------
+ * The game sets GPU blend via flSetRenderState(FLRENDER_ALPHABLENDMODE,v):
+ * low nibble = src factor, high nibble = dst factor (PS2/PSP encoding).
+ * 0x32 = standard alpha (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) = the common case
+ * and what citro2d already does. Effects (clash flash, sparks) use other
+ * values — typically additive — which previously rendered as opaque blocks
+ * because we ignored the mode. We switch the C3D blend equation on change,
+ * flushing C2D's batch first so prior draws keep their blend. */
+static unsigned int s_blend_mode = 0x32;
+static unsigned int s_blend_op = 0;
+static int s_blend_applied = -1; /* 0=alpha, 1=additive, -1=unset */
+
+void ctrGuSetBlendMode(unsigned int mode) {
+    s_blend_mode = mode;
+#if GU_PROFILE
+    static unsigned int seen[16];
+    static int nseen;
+    int known = 0;
+    for (int i = 0; i < nseen; i++)
+        if (seen[i] == mode) known = 1;
+    if (!known && nseen < 16) {
+        seen[nseen++] = mode;
+        debug_print("blend: ALPHABLENDMODE 0x%x", mode);
+    }
+#endif
+}
+
+void ctrGuSetBlendOp(unsigned int op) { s_blend_op = op; }
+
+static void apply_blend(void) {
+    /* 0x32 is standard alpha; treat every other mode as additive (the only
+     * other family the game uses for visible fx). Refined per logs if a
+     * non-0x32 alpha case turns up. */
+    int additive = (s_blend_mode != 0x32);
+    if (additive == s_blend_applied)
+        return;
+    C2D_Flush(); /* emit queued draws under the previous blend */
+    if (additive)
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE, GPU_SRC_ALPHA,
+                       GPU_ONE);
+    else
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+                       GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+    s_blend_applied = additive;
+}
+
 void ctrGuFrameBegin(void) {
     /* Dynamic sheets (texcash melts) are detected by content checksum at
      * first bind each frame — see resolve_texture.
@@ -148,6 +195,11 @@ void ctrGuFrameBegin(void) {
                     (unsigned long)(prof_conv_ticks / cps), (unsigned long)prof_csum,
                     (unsigned long)(prof_csum_ticks / cps), (unsigned long)prof_quads,
                     (unsigned long)prof_misses);
+        if (prof_texsolid || prof_colorspr || prof_colortri)
+            debug_print("   paths: texAsSolid=%lu colorSpr=%lu colorTri=%lu",
+                        (unsigned long)prof_texsolid, (unsigned long)prof_colorspr,
+                        (unsigned long)prof_colortri);
+        prof_texsolid = prof_colorspr = prof_colortri = 0;
         if (prof_conv)
             debug_print("   fmt T4=%lu T8=%lu 5551=%lu 4444=%lu 8888=%lu other=%lu  last=%lux%lu",
                         (unsigned long)prof_fmt[GU_PSM_T4], (unsigned long)prof_fmt[GU_PSM_T8],
@@ -526,6 +578,7 @@ void ctrGuDrawTexQuad(float x1, float y1, float u1, float v1, float x2, float y2
     if (!e)
         return;
     PROF_ADD(quads, 1);
+    apply_blend();
 
     /* GU accepts corner pairs in any order (mirrored sprites swap them);
      * C2D needs a positive-size dest rect, so normalize and mirror UVs. */
@@ -568,6 +621,7 @@ void ctrGuDrawTexQuad(float x1, float y1, float u1, float v1, float x2, float y2
 
 void ctrGuDrawRectSolid(float x, float y, float w, float h, uint32_t color) {
     /* overlay helper (menu/debug) — draw on top */
+    apply_blend();
     C2D_DrawRectSolid(x, y, 0.95f, w, h, color);
 }
 
@@ -631,6 +685,7 @@ typedef struct {
 
 void sceGuDrawArray(int prim, int vtype, int count, const void *indices, const void *vertices) {
     (void)indices;
+    apply_blend();
 
     if (prim == GU_SPRITES && vtype == VTYPE_TEX_SPRITE) {
         const GuTexVertex *v = (const GuTexVertex *)vertices;
@@ -644,6 +699,7 @@ void sceGuDrawArray(int prim, int vtype, int count, const void *indices, const v
             }
         } else {
             for (int i = 0; i + 1 < count; i += 2) {
+                PROF_ADD(texsolid, 1);
                 C2D_DrawRectSolid(v[i].x, v[i].y, map_depth(v[i + 1].z), v[i + 1].x - v[i].x,
                                   v[i + 1].y - v[i].y, v[i + 1].colour);
             }
@@ -665,6 +721,7 @@ void sceGuDrawArray(int prim, int vtype, int count, const void *indices, const v
     if (prim == GU_SPRITES && vtype == VTYPE_COLOR_TRI) {
         const GuColorVertex *v = (const GuColorVertex *)vertices;
         for (int i = 0; i + 1 < count; i += 2) {
+            PROF_ADD(colorspr, 1);
             C2D_DrawRectSolid(v[i].x, v[i].y, map_depth(v[i + 1].z), v[i + 1].x - v[i].x,
                               v[i + 1].y - v[i].y, v[i + 1].colour);
         }
@@ -674,6 +731,7 @@ void sceGuDrawArray(int prim, int vtype, int count, const void *indices, const v
     if (prim == GU_TRIANGLES && vtype == VTYPE_COLOR_TRI) {
         const GuColorVertex *v = (const GuColorVertex *)vertices;
         for (int i = 0; i + 2 < count; i += 3) {
+            PROF_ADD(colortri, 1);
             C2D_DrawTriangle(v[i].x, v[i].y, v[i].colour,
                              v[i + 1].x, v[i + 1].y, v[i + 1].colour,
                              v[i + 2].x, v[i + 2].y, v[i + 2].colour, map_depth(v[i].z));

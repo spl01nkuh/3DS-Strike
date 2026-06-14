@@ -147,6 +147,15 @@ void startFrame() {
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     C2D_TargetClear(s_top_target, abgr_to_c2d(bg_color));
     C2D_SceneBegin(s_top_target);
+
+    /* Discard fully-transparent texels (CPS3 sprites have hard 1-bit alpha)
+     * so they don't write the depth buffer. Without this, a front sprite's
+     * transparent edges write depth and clip sprites drawn behind them,
+     * producing rectangular halo artifacts wherever alpha sprites overlap
+     * (heavy on the VS clash / fight fx). Re-asserted each frame in case
+     * C2D's scene setup touches the alpha-test stage. */
+    C3D_AlphaTest(true, GPU_GREATER, 0);
+
     s_in_frame = 1;
 
     ppgResetTextureCache();
