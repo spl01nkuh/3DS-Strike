@@ -33,9 +33,11 @@ static GuState s_gu;
 
 /* ------------------------------------------------------ texture cache -- */
 
-#define TEXCACHE_SIZE 64 /* must hold all (sheet,palette) variants of a busy
-                          * scene (char select) so they coexist instead of
-                          * thrashing — see resolve_texture pal_reuse note */
+#define TEXCACHE_SIZE 128 /* must exceed a scene's per-frame texture working
+                           * set or the cache thrashes (conv==miss). The fight
+                           * screen binds ~95 distinct textures/frame (stage +
+                           * both fighters + HUD + fx); 64 thrashed it to 3fps.
+                           * See resolve_texture pal_reuse note. */
 
 typedef struct {
     const void *tex_ptr;
