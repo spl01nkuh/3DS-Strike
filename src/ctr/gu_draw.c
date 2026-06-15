@@ -33,11 +33,12 @@ static GuState s_gu;
 
 /* ------------------------------------------------------ texture cache -- */
 
-#define TEXCACHE_SIZE 128 /* must exceed a scene's per-frame texture working
-                           * set or the cache thrashes (conv==miss). The fight
-                           * screen binds ~95 distinct textures/frame (stage +
-                           * both fighters + HUD + fx); 64 thrashed it to 3fps.
-                           * See resolve_texture pal_reuse note. */
+#define TEXCACHE_SIZE 256 /* must exceed a scene's per-frame texture working
+                           * set or the cache thrashes (miss every frame).
+                           * Detailed animated stages (Remy's clock temple)
+                           * exceed ~128 → ~10 textures/frame thrashed → 27fps.
+                           * Entries allocate lazily, so the cap only bounds
+                           * how many coexist, not RAM used. See pal_reuse note. */
 
 typedef struct {
     const void *tex_ptr;
@@ -64,6 +65,14 @@ typedef struct {
 static TexCacheEntry s_cache[TEXCACHE_SIZE];
 static uint32_t s_use_counter;
 static C2D_ImageTint s_tint;
+
+/* fast-path + palette-checksum memo (declared here so a full cache
+ * invalidate can reset them — otherwise they keep stale references and
+ * cause wrong/missing textures when content is swapped into reused buffers,
+ * e.g. the opening's fast image sequence). */
+static TexCacheEntry *s_last_resolved;
+static const void *s_memo_clut;
+static uint32_t s_memo_sum, s_memo_frame = ~0u;
 
 /* Value LUTs for direct 16-bit formats: the PS2->PICA channel swap is a pure
  * function of the pixel value (palette-independent), so a one-time 64Ki-entry
@@ -92,6 +101,7 @@ static uint32_t prof_dim_w, prof_dim_h; /* last converted dims */
 static uint32_t prof_texsolid, prof_colorspr, prof_colortri; /* draw-path mix */
 static uint32_t prof_cfull, prof_ctiles, prof_cpal, prof_ctilecnt; /* conv sources */
 static uint64_t prof_frame_ticks, prof_frame_max, prof_last_tick; /* total frame period */
+static uint64_t prof_draw_ticks; /* time in C2D draw submission */
 #define PROF_ADD(var, n) (prof_##var += (n))
 #define PROF_TICK_START() uint64_t _t0 = svcGetSystemTick()
 #define PROF_TICK_END(acc) (prof_##acc += svcGetSystemTick() - _t0)
@@ -196,12 +206,13 @@ void ctrGuFrameBegin(void) {
     }
     if (++prof_frames >= 60) {
         uint64_t cps = (uint64_t)CPU_TICKS_PER_USEC;
-        debug_print("prof/60f: FRAME avg=%lu us max=%lu us | conv=%lu rows=%lu (%lu us)  csum=%lu (%lu us)  quads=%lu  miss=%lu",
+        debug_print("prof/60f: FRAME avg=%lu max=%lu | conv=%lu(%lu us) csum=%lu(%lu us) draw=%lu us quads=%lu miss=%lu",
                     (unsigned long)(prof_frame_ticks / cps / 60), (unsigned long)(prof_frame_max / cps),
-                    (unsigned long)prof_conv, (unsigned long)prof_rows,
+                    (unsigned long)prof_conv,
                     (unsigned long)(prof_conv_ticks / cps), (unsigned long)prof_csum,
-                    (unsigned long)(prof_csum_ticks / cps), (unsigned long)prof_quads,
-                    (unsigned long)prof_misses);
+                    (unsigned long)(prof_csum_ticks / cps), (unsigned long)(prof_draw_ticks / cps),
+                    (unsigned long)prof_quads, (unsigned long)prof_misses);
+        prof_draw_ticks = 0;
         if (prof_texsolid || prof_colorspr || prof_colortri)
             debug_print("   paths: texAsSolid=%lu colorSpr=%lu colorTri=%lu",
                         (unsigned long)prof_texsolid, (unsigned long)prof_colorspr,
@@ -263,6 +274,9 @@ void ctrGuTexcacheInvalidate(const void *src) {
             s_cache[i].valid = 0;
         }
     }
+    /* reset fast-path + palette memo so they don't reference cleared state */
+    s_last_resolved = NULL;
+    s_memo_frame = ~0u;
 }
 
 static void add_dirty_tile(TexCacheEntry *e, int x, int y, int w, int h) {
@@ -518,14 +532,57 @@ static int convert_texture(TexCacheEntry *e) {
     return 1;
 }
 
+/* a cache entry matched the bind: reconvert dirty tiles if needed, mark used */
+static TexCacheEntry *use_entry(TexCacheEntry *e) {
+    if (e->dirty_n != 0) {
+        reconvert_entry(e, 0); /* full if dirty_n<0, else the tile list */
+        e->dirty_n = 0;
+        e->check_frame = s_frame_id; /* trust the hook; refresh baseline lazily */
+    } else if (s_frame_id - e->check_frame >= 240) {
+        /* rare safety net for writers we haven't hooked */
+        e->check_frame = s_frame_id;
+        uint32_t ds = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
+        if (ds != e->data_sum) {
+            e->data_sum = ds;
+            reconvert_entry(e, 1);
+        }
+    }
+    e->last_use = ++s_use_counter;
+    e->drawn_frame = s_frame_id;
+    return e;
+}
+
 static TexCacheEntry *resolve_texture(void) {
     if (!s_gu.tex_ptr)
         return NULL;
 
-    int pal_count = (s_gu.format == GU_PSM_T4) ? 16 : 256;
-    uint32_t sum = (s_gu.format == GU_PSM_T4 || s_gu.format == GU_PSM_T8)
-                       ? (s_gu.clut_ptr ? clut_checksum(s_gu.clut_ptr, pal_count) : 0)
-                       : 0;
+    /* Palette checksum is the per-quad hot cost (256 entries for T8).
+     * Palettes are stable within a frame, so memoize per (clut_ptr, frame)
+     * instead of re-hashing for every sprite that shares a palette. */
+    static const void *memo_clut;
+    static uint32_t memo_sum, memo_frame = ~0u;
+    uint32_t sum;
+    if (s_gu.format == GU_PSM_T4 || s_gu.format == GU_PSM_T8) {
+        if (s_gu.clut_ptr == memo_clut && memo_frame == s_frame_id) {
+            sum = memo_sum;
+        } else {
+            int pal_count = (s_gu.format == GU_PSM_T4) ? 16 : 256;
+            sum = s_gu.clut_ptr ? clut_checksum(s_gu.clut_ptr, pal_count) : 0;
+            memo_clut = s_gu.clut_ptr;
+            memo_sum = sum;
+            memo_frame = s_frame_id;
+        }
+    } else {
+        sum = 0;
+    }
+
+    /* fast path: identical bind to the previous quad (batched sprites) —
+     * skip the linear cache scan entirely */
+    TexCacheEntry *L = s_last_resolved;
+    if (L && L->valid && L->tex_ptr == s_gu.tex_ptr && L->clut_ptr == s_gu.clut_ptr &&
+        L->clut_sum == sum && L->w == s_gu.tex_w && L->h == s_gu.tex_h &&
+        L->format == s_gu.format && L->swizzled == s_gu.swizzled)
+        return use_entry(L);
 
     TexCacheEntry *lru = &s_cache[0];
     TexCacheEntry *pal_reuse = NULL; /* same pixels, different palette (cycling) */
@@ -537,25 +594,8 @@ static TexCacheEntry *resolve_texture(void) {
             pal_reuse = e;
         if (e->valid && e->tex_ptr == s_gu.tex_ptr && e->clut_ptr == s_gu.clut_ptr && e->clut_sum == sum &&
             e->w == s_gu.tex_w && e->h == s_gu.tex_h && e->format == s_gu.format && e->swizzled == s_gu.swizzled) {
-            /* melt hooks report exact dirty TILES — reconvert only those
-             * (no full-width rows, no per-reconvert checksum). The periodic
-             * checksum is a rare safety net for unhooked writers. */
-            if (e->dirty_n != 0) {
-                reconvert_entry(e, 0); /* full if dirty_n<0, else the tile list */
-                e->dirty_n = 0;
-                e->check_frame = s_frame_id; /* trust the hook; refresh baseline lazily */
-            } else if (s_frame_id - e->check_frame >= 240) {
-                /* rare safety net for writers we haven't hooked */
-                e->check_frame = s_frame_id;
-                uint32_t ds = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
-                if (ds != e->data_sum) {
-                    e->data_sum = ds;
-                    reconvert_entry(e, 1);
-                }
-            }
-            e->last_use = ++s_use_counter;
-            e->drawn_frame = s_frame_id;
-            return e;
+            s_last_resolved = e;
+            return use_entry(e);
         }
         if (!e->valid)
             lru = e;
@@ -583,6 +623,7 @@ static TexCacheEntry *resolve_texture(void) {
             }
             pal_reuse->last_use = ++s_use_counter;
             pal_reuse->drawn_frame = s_frame_id;
+            s_last_resolved = pal_reuse;
             return pal_reuse;
         }
         return NULL; /* genuinely out of slots this frame */
@@ -611,6 +652,8 @@ static TexCacheEntry *resolve_texture(void) {
 
     lru->valid = 1;
     lru->last_use = ++s_use_counter;
+    lru->drawn_frame = s_frame_id;
+    s_last_resolved = lru;
     return lru;
 }
 
@@ -660,7 +703,11 @@ void ctrGuDrawTexQuad(float x1, float y1, float u1, float v1, float x2, float y2
     s_quad_z_set = 0;
 
     C2D_PlainImageTint(&s_tint, color, 1.0f);
+#if GU_PROFILE
+    { uint64_t _d = svcGetSystemTick(); C2D_DrawImage(img, &params, &s_tint); prof_draw_ticks += svcGetSystemTick() - _d; }
+#else
     C2D_DrawImage(img, &params, &s_tint);
+#endif
 }
 
 void ctrGuDrawRectSolid(float x, float y, float w, float h, uint32_t color) {
