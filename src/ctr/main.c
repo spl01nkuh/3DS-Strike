@@ -14,6 +14,15 @@
 
 #include "Game/main.h"
 
+/* The whole game engine runs on the main thread (main -> AcrMain -> the game
+ * loop and everything it calls). libctru's default 3dsx stack is only 32 KiB,
+ * far too small for the decompiled engine's call depth and large stack locals.
+ * On real hardware that overflows and faults at boot; Azahar's looser memory
+ * map lets the overflow scribble into adjacent memory and survive — the exact
+ * "runs in the emulator, crashes on a real 3DS at startup" signature. 1 MiB is
+ * negligible against the 64/124 MiB app heap and leaves generous headroom. */
+unsigned int __stacksize__ = 1024 * 1024;
+
 /* global variables (game + backends reference these) */
 volatile int g_request_pause = 0;
 extern int RTT_Enabled;
