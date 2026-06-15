@@ -91,7 +91,7 @@ void ctrGuInit(void) {
 static uint32_t s_frame_id;
 
 /* --- lightweight profiler (GU_PROFILE) --------------------------------- */
-#define GU_PROFILE 1
+#define GU_PROFILE 0 /* off for release: removes per-quad timing overhead + log spam */
 #if GU_PROFILE
 static uint32_t prof_frames;
 static uint32_t prof_conv, prof_rows, prof_quads, prof_csum, prof_misses;

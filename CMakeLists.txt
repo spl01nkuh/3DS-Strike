@@ -111,6 +111,26 @@ ctr_generate_smdh(${PROJECT_NAME}.smdh
     AUTHOR "3s decomp community"
 )
 
+# Bottom-screen artwork: convert a user-supplied PNG to a C2D t3x in romfs.
+# If no PNG is present the romfs is empty and the bottom screen stays black
+# (graphics.c handles the missing-image case gracefully).
+set(BOTTOM_PNG "C:/Users/temz1/OneDrive/Documents/sf3 testing/bottom.png")
+set(ROMFS_DIR ${CMAKE_BINARY_DIR}/romfs)
+file(MAKE_DIRECTORY ${ROMFS_DIR})
+if(EXISTS "${BOTTOM_PNG}")
+    add_custom_command(
+        OUTPUT ${ROMFS_DIR}/bottom.t3x
+        COMMAND ${CTR_TEX3DS_EXE} -o ${ROMFS_DIR}/bottom.t3x "${BOTTOM_PNG}"
+        DEPENDS "${BOTTOM_PNG}"
+        COMMENT "Converting bottom.png -> romfs/bottom.t3x")
+    add_custom_target(bottom_t3x ALL DEPENDS ${ROMFS_DIR}/bottom.t3x)
+    add_dependencies(${PROJECT_NAME} bottom_t3x)
+    message(STATUS "Bottom-screen image: ${BOTTOM_PNG}")
+else()
+    message(STATUS "Bottom-screen image: none (bottom screen will be black)")
+endif()
+
 ctr_create_3dsx(${PROJECT_NAME}
     SMDH ${PROJECT_NAME}.smdh
+    ROMFS ${ROMFS_DIR}
 )

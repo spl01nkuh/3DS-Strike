@@ -110,6 +110,11 @@ void setupScaling(int mode) {
 
 void enableOffscreenMode() {}
 
+static C3D_RenderTarget *s_bot_target;
+static C2D_SpriteSheet s_bot_sheet;
+static C2D_Image s_bot_img;
+static int s_have_bot;
+
 void initGu() {
     gfxInitDefault();
     gfxSet3D(false);
@@ -119,6 +124,16 @@ void initGu() {
     C2D_Prepare();
 
     s_top_target = C2D_CreateScreenTarget(GFX_TOP, GFX_LEFT);
+    s_bot_target = C2D_CreateScreenTarget(GFX_BOTTOM, GFX_LEFT);
+
+    /* Optional bottom-screen artwork, baked into romfs. Absent → black. */
+    if (R_SUCCEEDED(romfsInit())) {
+        s_bot_sheet = C2D_SpriteSheetLoad("romfs:/bottom.t3x");
+        if (s_bot_sheet && C2D_SpriteSheetCount(s_bot_sheet) > 0) {
+            s_bot_img = C2D_SpriteSheetGetImage(s_bot_sheet, 0);
+            s_have_bot = 1;
+        }
+    }
 
     ctrGuInit();
 
@@ -163,6 +178,16 @@ void startFrame() {
 
 void endFrame() {
     if (s_in_frame) {
+        /* draw the bottom screen within the same GPU frame */
+        C2D_TargetClear(s_bot_target, C2D_Color32(0, 0, 0, 0xFF));
+        if (s_have_bot) {
+            C2D_SceneBegin(s_bot_target);
+            float iw = (float)s_bot_img.subtex->width;
+            float ih = (float)s_bot_img.subtex->height;
+            float sx = iw > 0 ? 320.0f / iw : 1.0f;
+            float sy = ih > 0 ? 240.0f / ih : 1.0f;
+            C2D_DrawImageAt(s_bot_img, 0.0f, 0.0f, 0.0f, NULL, sx, sy);
+        }
         C3D_FrameEnd(0);
         s_in_frame = 0;
     }
