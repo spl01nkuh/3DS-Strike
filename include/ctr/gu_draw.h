@@ -28,6 +28,11 @@ void ctrGuDrawTexQuad(float x1, float y1, float u1, float v1,
 /* solid rect, ABGR color */
 void ctrGuDrawRectSolid(float x, float y, float w, float h, uint32_t color);
 
+/* draw opaque black bars over the screen-edge margins outside the centered
+ * CPS3 play area, cropping sprite/background bleed (off_x/off_y = per-side
+ * margin in screen px; 0 = no crop). Call while the top scene is active. */
+void ctrGuDrawCropBars(float off_x, float off_y);
+
 #ifdef __cplusplus
 }
 #endif

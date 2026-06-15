@@ -178,6 +178,11 @@ void startFrame() {
 
 void endFrame() {
     if (s_in_frame) {
+        /* crop the centered play area: paint black over the screen-edge margins
+         * so edge sprites/background don't bleed into them. Done while the top
+         * scene is still active (set in startFrame). */
+        ctrGuDrawCropBars(Scale_Off_X, Scale_Off_Y);
+
         /* draw the bottom screen within the same GPU frame. Always clear AND
          * begin its scene (begin flushes the top batch and makes the bottom
          * the active target) so no stale framebuffer shows through. */

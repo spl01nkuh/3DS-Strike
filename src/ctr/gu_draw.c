@@ -716,6 +716,34 @@ void ctrGuDrawRectSolid(float x, float y, float w, float h, uint32_t color) {
     C2D_DrawRectSolid(x, y, 0.95f, w, h, color);
 }
 
+void ctrGuDrawCropBars(float off_x, float off_y) {
+    /* The game renders the 384x224 CPS3 field centered in the 400x240 top
+     * screen (NATIVE -> 8px margins all round). On real hardware the field was
+     * clipped to that window; here there is no scissor, so sprites/background
+     * at the field edge bleed into the margins ("artifacts on the sides").
+     * Paint the margins opaque black at frontmost depth to reproduce the crop.
+     * Only the margin strips are touched — never the play area. */
+    const float SW = 400.0f, SH = 240.0f;
+    if (off_x <= 0.0f && off_y <= 0.0f)
+        return; /* stretch mode: full-bleed, nothing to crop */
+
+    /* force standard alpha so black actually covers (the last fx draw may have
+     * left additive blend, under which black would be a no-op) */
+    s_blend_mode = 0x32;
+    apply_blend();
+
+    const uint32_t black = C2D_Color32(0, 0, 0, 0xFF);
+    const float z = 1.0f; /* >= every game layer's mapped depth (GEQUAL) */
+    if (off_x > 0.0f) {
+        C2D_DrawRectSolid(0.0f, 0.0f, z, off_x, SH, black);       /* left  */
+        C2D_DrawRectSolid(SW - off_x, 0.0f, z, off_x, SH, black); /* right */
+    }
+    if (off_y > 0.0f) {
+        C2D_DrawRectSolid(0.0f, 0.0f, z, SW, off_y, black);       /* top    */
+        C2D_DrawRectSolid(0.0f, SH - off_y, z, SW, off_y, black); /* bottom */
+    }
+}
+
 /* --------------------------------------------- GU entry points (fl.c) -- */
 
 void sceGuTexImage(int mipmap, int width, int height, int tbw, const void *tbp) {
