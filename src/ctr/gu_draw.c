@@ -45,7 +45,13 @@ typedef struct {
     uint32_t clut_sum;
     uint32_t data_sum; /* full content checksum — detects CPU-side melt writes */
     uint32_t check_frame;
-    uint32_t dirty_min, dirty_max; /* byte range written by melt hooks; min>max = clean */
+    /* Dirty TILE list written by melt hooks. Animation tiles scatter across
+     * the sheet, so a bounding box covers everything — we track each changed
+     * tile and reconvert only those. dirty_n == -1 means whole sheet dirty
+     * (overflow or stream-in); 0 means clean. */
+#define MAX_DIRTY_TILES 512
+    int dirty_n;
+    struct { int16_t x, y, w, h; } dirty[MAX_DIRTY_TILES];
     uint32_t drawn_frame;          /* draws are deferred to frame end — never mutate
                                       a texture already referenced this frame */
     int w, h, format, swizzled;
@@ -84,6 +90,7 @@ static uint64_t prof_conv_ticks, prof_csum_ticks;
 static uint32_t prof_fmt[8];      /* conversions per GU_PSM_* */
 static uint32_t prof_dim_w, prof_dim_h; /* last converted dims */
 static uint32_t prof_texsolid, prof_colorspr, prof_colortri; /* draw-path mix */
+static uint32_t prof_cfull, prof_ctiles, prof_cpal, prof_ctilecnt; /* conv sources */
 static uint64_t prof_frame_ticks, prof_frame_max, prof_last_tick; /* total frame period */
 #define PROF_ADD(var, n) (prof_##var += (n))
 #define PROF_TICK_START() uint64_t _t0 = svcGetSystemTick()
@@ -201,6 +208,12 @@ void ctrGuFrameBegin(void) {
                         (unsigned long)prof_colortri);
         prof_texsolid = prof_colorspr = prof_colortri = 0;
         if (prof_conv)
+            debug_print("   convsrc: full=%lu pal=%lu tileconv=%lu (tiles=%lu) miss=%lu",
+                        (unsigned long)prof_cfull, (unsigned long)prof_cpal,
+                        (unsigned long)prof_ctiles, (unsigned long)prof_ctilecnt,
+                        (unsigned long)prof_misses);
+        prof_cfull = prof_ctiles = prof_cpal = prof_ctilecnt = 0;
+        if (prof_conv)
             debug_print("   fmt T4=%lu T8=%lu 5551=%lu 4444=%lu 8888=%lu other=%lu  last=%lux%lu",
                         (unsigned long)prof_fmt[GU_PSM_T4], (unsigned long)prof_fmt[GU_PSM_T8],
                         (unsigned long)prof_fmt[GU_PSM_5551], (unsigned long)prof_fmt[GU_PSM_4444],
@@ -252,20 +265,50 @@ void ctrGuTexcacheInvalidate(const void *src) {
     }
 }
 
-/* called from the melt/tile-streaming writers (ppgRenewDotDataSeqs etc.):
- * record the written byte range so the next bind reconverts only that span */
-void ctrGuTexcacheNotifyWrite(const void *sheet_base, uint32_t start, uint32_t end) {
+static void add_dirty_tile(TexCacheEntry *e, int x, int y, int w, int h) {
+    if (e->dirty_n < 0)
+        return; /* already whole-sheet dirty */
+    if (e->dirty_n >= MAX_DIRTY_TILES) {
+        e->dirty_n = -1; /* overflow → fall back to full reconvert */
+        return;
+    }
+    int i = e->dirty_n++;
+    e->dirty[i].x = (int16_t)x;
+    e->dirty[i].y = (int16_t)y;
+    e->dirty[i].w = (int16_t)w;
+    e->dirty[i].h = (int16_t)h;
+}
+
+/* Per-tile melt notification (ppgRenewDotDataSeqs): a tile of tw x th pixels
+ * was written at byte offset `boff` within the sheet. Convert the byte offset
+ * to a texel position using the cached sheet's width/format, and expand the
+ * dirty rect — so the next bind reconverts just the changed tiles, not the
+ * full-width rows spanning them (the big fight-perf win). */
+void ctrGuTexcacheNotifyTile(const void *sheet_base, uint32_t boff, int tw, int th) {
     for (int i = 0; i < TEXCACHE_SIZE; i++) {
         TexCacheEntry *e = &s_cache[i];
-        if (e->valid && e->tex_ptr == sheet_base) {
-            if (e->dirty_min > e->dirty_max) {
-                e->dirty_min = start;
-                e->dirty_max = end;
-            } else {
-                if (start < e->dirty_min) e->dirty_min = start;
-                if (end > e->dirty_max) e->dirty_max = end;
-            }
-        }
+        if (!e->valid || e->tex_ptr != sheet_base)
+            continue;
+        uint32_t row_bytes = (e->format == GU_PSM_T4) ? (uint32_t)e->w / 2
+                             : (e->format == GU_PSM_T8) ? (uint32_t)e->w
+                                                        : (uint32_t)e->w * 2;
+        if (!row_bytes) continue;
+        int y = (int)(boff / row_bytes);
+        uint32_t xb = boff % row_bytes;
+        int x = (e->format == GU_PSM_T4) ? (int)(xb * 2)
+                : (e->format == GU_PSM_T8) ? (int)xb
+                                           : (int)(xb / 2);
+        add_dirty_tile(e, x, y, tw, th);
+    }
+}
+
+/* Whole-sheet invalidation (texcash stream-in, ppgRenewTexChunkSeqs). */
+void ctrGuTexcacheNotifyWrite(const void *sheet_base, uint32_t start, uint32_t end) {
+    (void)start; (void)end;
+    for (int i = 0; i < TEXCACHE_SIZE; i++) {
+        TexCacheEntry *e = &s_cache[i];
+        if (e->valid && e->tex_ptr == sheet_base)
+            e->dirty_n = -1; /* whole sheet */
     }
 }
 
@@ -319,93 +362,108 @@ static void psp_unswizzle(uint8_t *out, const uint8_t *in, uint32_t width_bytes,
     }
 }
 
-/* fill rows [y0, y1) of an already-allocated C3D_Tex from the source */
-static int convert_texture_into_impl(TexCacheEntry *e, int y0, int y1) {
-    int w = e->w, h = e->h;
+/* Morton offsets within an 8x8 tile: off(x,y) = mx[x&7] + my[y&7].
+ * Even x and x+1 map to adjacent offsets → 2-texel u32 stores. */
+static const uint16_t s_mx[8] = {0, 1, 4, 5, 16, 17, 20, 21};
+static const uint16_t s_my[8] = {0, 2, 8, 10, 32, 34, 40, 42};
 
+/* prebuilt per-sheet conversion state, set once before converting tiles */
+typedef struct {
+    const uint8_t *src;
+    uint32_t row_bytes, tiles_w;
+    uint16_t *dst;
+    int format;
+    const uint16_t *pal5551;  /* T8 / fallback */
+    const uint32_t *t4lut;    /* T4 pair-LUT */
+    const uint16_t *dlut;     /* direct 5551/4444 value LUT */
+} ConvCtx;
+
+/* convert one tile-aligned rect using prebuilt ctx (no per-call setup) */
+static void convert_rect(const ConvCtx *c, int w, int h, int x0, int y0, int x1, int y1) {
+    x0 &= ~7; y0 &= ~7;
+    x1 = (x1 + 7) & ~7; y1 = (y1 + 7) & ~7;
+    if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
+    if (x1 > w) x1 = w;
     if (y1 > h) y1 = h;
+    if (x0 >= x1 || y0 >= y1) return;
+    PROF_ADD(rows, ((y1 - y0) * (x1 - x0)) / (w ? w : 1));
 
-    PROF_ADD(conv, 1);
-    PROF_ADD(rows, y1 - y0);
+    uint32_t *dst32 = (uint32_t *)c->dst;
+    if (c->format == GU_PSM_T4 && c->t4lut) {
+        for (int y = y0; y < y1; y++) {
+            const uint8_t *row = c->src + y * c->row_bytes;
+            uint32_t yb = ((uint32_t)y >> 3) * c->tiles_w * 64 + s_my[y & 7];
+            for (int x = x0; x < x1; x += 2)
+                dst32[(yb + ((uint32_t)x >> 3) * 64 + s_mx[x & 7]) >> 1] = c->t4lut[row[x >> 1]];
+        }
+    } else if (c->format == GU_PSM_T8 && c->pal5551) {
+        for (int y = y0; y < y1; y++) {
+            const uint8_t *row = c->src + y * c->row_bytes;
+            uint32_t yb = ((uint32_t)y >> 3) * c->tiles_w * 64 + s_my[y & 7];
+            for (int x = x0; x < x1; x += 2)
+                dst32[(yb + ((uint32_t)x >> 3) * 64 + s_mx[x & 7]) >> 1] =
+                    (uint32_t)c->pal5551[row[x]] | ((uint32_t)c->pal5551[row[x + 1]] << 16);
+        }
+    } else if (c->dlut) {
+        for (int y = y0; y < y1; y++) {
+            const uint16_t *row16 = (const uint16_t *)(c->src + y * c->row_bytes);
+            uint32_t yb = ((uint32_t)y >> 3) * c->tiles_w * 64 + s_my[y & 7];
+            for (int x = x0; x < x1; x += 2)
+                dst32[(yb + ((uint32_t)x >> 3) * 64 + s_mx[x & 7]) >> 1] =
+                    (uint32_t)c->dlut[row16[x]] | ((uint32_t)c->dlut[row16[x + 1]] << 16);
+        }
+    }
+}
+
+/* Reconvert e: full sheet, or just its dirty tile list. The palette LUT is
+ * built ONCE here, then every tile reuses it — converting per-tile without
+ * this would rebuild the 256-entry LUT hundreds of times per frame. */
+static int reconvert_entry(TexCacheEntry *e, int full) {
+    int w = e->w, h = e->h;
+    static uint8_t *swz; /* scratch for the (rare) swizzled path */
+    static size_t swz_sz;
+
 #if GU_PROFILE
     prof_fmt[e->format & 7]++;
     prof_dim_w = w; prof_dim_h = h;
 #endif
 
-    const uint8_t *src = (const uint8_t *)e->tex_ptr;
-    uint8_t *linear = NULL;
+    ConvCtx c;
+    c.src = (const uint8_t *)e->tex_ptr;
+    c.format = e->format;
+    c.dst = (uint16_t *)e->tex.data;
+    c.row_bytes = (e->format == GU_PSM_T4) ? (uint32_t)w / 2
+                  : (e->format == GU_PSM_T8) ? (uint32_t)w
+                                             : (uint32_t)w * 2;
+    c.tiles_w = (uint32_t)w >> 3;
+    c.pal5551 = NULL;
+    c.t4lut = NULL;
+    c.dlut = NULL;
 
-    /* source row size in bytes */
-    uint32_t row_bytes;
-    switch (e->format) {
-    case GU_PSM_T4: row_bytes = w / 2; break;
-    case GU_PSM_T8: row_bytes = w; break;
-    default: row_bytes = w * 2; break; /* 5551/4444/5650 direct */
+    if (e->swizzled) { /* always 0 in this port, but keep correct */
+        size_t need = c.row_bytes * h;
+        if (need > swz_sz) { free(swz); swz = malloc(need); swz_sz = swz ? need : 0; }
+        if (swz) { psp_unswizzle(swz, c.src, c.row_bytes, h); c.src = swz; }
     }
 
-    if (e->swizzled) {
-        linear = malloc(row_bytes * h);
-        if (!linear) {
-            C3D_TexDelete(&e->tex);
-            return 0;
-        }
-        psp_unswizzle(linear, src, row_bytes, h);
-        src = linear;
-    }
-
+    static uint16_t pal5551[256];
+    static uint32_t t4lut[256];
     const uint16_t *pal = (const uint16_t *)e->clut_ptr;
-    uint16_t *dst = (uint16_t *)e->tex.data;
-    uint16_t pal5551[256];
-
-    int pal_count = (e->format == GU_PSM_T4) ? 16 : 256;
-    if (pal) {
-        /* CPS3 colorkey: index 0 is transparent (keep its palette alpha so
-         * sprite backgrounds stay clear and opaque bg tiles stay opaque);
-         * EVERY other index is a visible color and must be opaque. Without
-         * forcing this, palette entries whose alpha bit is unset get
-         * discarded by the alpha test, breaking up text/glyphs. */
+    if ((e->format == GU_PSM_T4 || e->format == GU_PSM_T8) && pal) {
+        int pal_count = (e->format == GU_PSM_T4) ? 16 : 256;
+        /* CPS3 colorkey: index 0 transparent (keep palette alpha), all other
+         * indices forced opaque so alpha test doesn't tear glyphs/sprites. */
         pal5551[0] = conv5551(pal[0]);
         for (int i = 1; i < pal_count; i++)
-            pal5551[i] = conv5551(pal[i]) | 1u; /* alpha = bit 0 in RGBA5551 */
-    }
-
-    /* Precomputed Morton offsets within an 8x8 tile: off(x,y) inside a tile
-     * = mx[x&7] + my[y&7]. Hoisting these out of the per-pixel loop replaces
-     * two morton7() calls per texel with two array reads. Within a tile,
-     * even x and x+1 map to adjacent offsets, enabling 2-texel u32 stores. */
-    static const uint16_t mx[8] = {0, 1, 4, 5, 16, 17, 20, 21};
-    static const uint16_t my[8] = {0, 2, 8, 10, 32, 34, 40, 42};
-    uint32_t tiles_w = (uint32_t)w >> 3;
-
-    if (e->format == GU_PSM_T4 && pal) {
-        /* two texels per source byte → one u32 store via pair-LUT */
-        uint32_t lut[256];
-        for (int b = 0; b < 256; b++)
-            lut[b] = (uint32_t)pal5551[b & 0xF] | ((uint32_t)pal5551[b >> 4] << 16);
-        uint32_t *dst32 = (uint32_t *)dst;
-        for (int y = y0; y < y1; y++) {
-            const uint8_t *row = src + y * row_bytes;
-            uint32_t ybase = ((uint32_t)y >> 3) * tiles_w * 64 + my[y & 7];
-            for (int x = 0; x < w; x += 2) {
-                uint32_t off = ybase + ((uint32_t)x >> 3) * 64 + mx[x & 7];
-                dst32[off >> 1] = lut[row[x >> 1]];
-            }
+            pal5551[i] = conv5551(pal[i]) | 1u;
+        c.pal5551 = pal5551;
+        if (e->format == GU_PSM_T4) {
+            for (int b = 0; b < 256; b++)
+                t4lut[b] = (uint32_t)pal5551[b & 0xF] | ((uint32_t)pal5551[b >> 4] << 16);
+            c.t4lut = t4lut;
         }
-    } else if (e->format == GU_PSM_T8 && pal) {
-        /* two independent bytes → combine into one u32 store */
-        uint32_t *dst32 = (uint32_t *)dst;
-        for (int y = y0; y < y1; y++) {
-            const uint8_t *row = src + y * row_bytes;
-            uint32_t ybase = ((uint32_t)y >> 3) * tiles_w * 64 + my[y & 7];
-            for (int x = 0; x < w; x += 2) {
-                uint32_t off = ybase + ((uint32_t)x >> 3) * 64 + mx[x & 7];
-                dst32[off >> 1] = (uint32_t)pal5551[row[x]] | ((uint32_t)pal5551[row[x + 1]] << 16);
-            }
-        }
-    } else {
-        /* direct 16-bit formats (5551/4444) — value-LUT + pair store */
-        int is4444 = (e->format == GU_PSM_4444);
+    } else if (e->format != GU_PSM_T4 && e->format != GU_PSM_T8) {
         if (!s_lut5551 || !s_lut4444) {
             s_lut5551 = (uint16_t *)malloc(65536 * sizeof(uint16_t));
             s_lut4444 = (uint16_t *)malloc(65536 * sizeof(uint16_t));
@@ -415,36 +473,25 @@ static int convert_texture_into_impl(TexCacheEntry *e, int y0, int y1) {
                     s_lut4444[v] = conv4444((uint16_t)v);
                 }
         }
-        const uint16_t *lut = is4444 ? s_lut4444 : s_lut5551;
-        uint32_t *dst32 = (uint32_t *)dst;
-        for (int y = y0; y < y1; y++) {
-            const uint16_t *row16 = (const uint16_t *)(src + y * row_bytes);
-            uint32_t ybase = ((uint32_t)y >> 3) * tiles_w * 64 + my[y & 7];
-            if (lut) {
-                for (int x = 0; x < w; x += 2) {
-                    uint32_t off = ybase + ((uint32_t)x >> 3) * 64 + mx[x & 7];
-                    dst32[off >> 1] = (uint32_t)lut[row16[x]] | ((uint32_t)lut[row16[x + 1]] << 16);
-                }
-            } else { /* alloc failed — slow but correct */
-                for (int x = 0; x < w; x++) {
-                    uint32_t off = ybase + ((uint32_t)x >> 3) * 64 + mx[x & 7];
-                    dst[off] = is4444 ? conv4444(row16[x]) : conv5551(row16[x]);
-                }
-            }
-        }
+        c.dlut = (e->format == GU_PSM_4444) ? s_lut4444 : s_lut5551;
     }
 
-    free(linear);
+    PROF_TICK_START();
+    PROF_ADD(conv, 1);
+    if (full || e->dirty_n < 0) {
+        PROF_ADD(cfull, 1);
+        convert_rect(&c, w, h, 0, 0, w, h);
+    } else {
+        PROF_ADD(ctiles, 1);
+        PROF_ADD(ctilecnt, e->dirty_n);
+        for (int t = 0; t < e->dirty_n; t++)
+            convert_rect(&c, w, h, e->dirty[t].x, e->dirty[t].y,
+                         e->dirty[t].x + e->dirty[t].w, e->dirty[t].y + e->dirty[t].h);
+    }
+    PROF_TICK_END(conv_ticks);
+
     C3D_TexFlush(&e->tex);
     return 1;
-}
-
-/* timing wrapper around the (multi-exit) converter */
-static int convert_texture_into(TexCacheEntry *e, int y0, int y1) {
-    PROF_TICK_START();
-    int r = convert_texture_into_impl(e, y0, y1);
-    PROF_TICK_END(conv_ticks);
-    return r;
 }
 
 /* allocate (or reuse) + fill a native texture for a cache entry */
@@ -461,10 +508,9 @@ static int convert_texture(TexCacheEntry *e) {
 
     e->data_sum = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
     e->check_frame = s_frame_id;
-    e->dirty_min = 1;
-    e->dirty_max = 0;
+    e->dirty_n = 0; /* clean */
 
-    if (!convert_texture_into(e, 0, e->h)) {
+    if (!reconvert_entry(e, 1)) {
         C3D_TexDelete(&e->tex);
         e->tex_alive = 0;
         return 0;
@@ -491,29 +537,20 @@ static TexCacheEntry *resolve_texture(void) {
             pal_reuse = e;
         if (e->valid && e->tex_ptr == s_gu.tex_ptr && e->clut_ptr == s_gu.clut_ptr && e->clut_sum == sum &&
             e->w == s_gu.tex_w && e->h == s_gu.tex_h && e->format == s_gu.format && e->swizzled == s_gu.swizzled) {
-            /* melt hooks report exact byte ranges — reconvert only those
-             * rows; the periodic checksum is a safety net for unhooked
-             * writers */
-            if (e->dirty_min <= e->dirty_max) {
-                uint32_t rb = (e->format == GU_PSM_T4) ? (uint32_t)e->w / 2
-                              : (e->format == GU_PSM_T8) ? (uint32_t)e->w
-                                                         : (uint32_t)e->w * 2;
-                int y0 = (int)(e->dirty_min / rb);
-                int y1 = (int)(e->dirty_max / rb) + 1;
-                e->dirty_min = 1;
-                e->dirty_max = 0;
-                convert_texture_into(e, y0, y1);
-                e->data_sum = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
-                e->check_frame = s_frame_id;
+            /* melt hooks report exact dirty TILES — reconvert only those
+             * (no full-width rows, no per-reconvert checksum). The periodic
+             * checksum is a rare safety net for unhooked writers. */
+            if (e->dirty_n != 0) {
+                reconvert_entry(e, 0); /* full if dirty_n<0, else the tile list */
+                e->dirty_n = 0;
+                e->check_frame = s_frame_id; /* trust the hook; refresh baseline lazily */
             } else if (s_frame_id - e->check_frame >= 240) {
-                /* rare safety net for writers we haven't hooked; the melt
-                 * hooks (dirty_min/max) handle the common dynamic case, so
-                 * full-sheet revalidation can be infrequent */
+                /* rare safety net for writers we haven't hooked */
                 e->check_frame = s_frame_id;
                 uint32_t ds = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
                 if (ds != e->data_sum) {
                     e->data_sum = ds;
-                    convert_texture_into(e, 0, e->h);
+                    reconvert_entry(e, 1);
                 }
             }
             e->last_use = ++s_use_counter;
@@ -537,9 +574,10 @@ static TexCacheEntry *resolve_texture(void) {
         if (pal_reuse) {
             pal_reuse->clut_ptr = s_gu.clut_ptr;
             pal_reuse->clut_sum = sum;
-            pal_reuse->dirty_min = 1;
-            pal_reuse->dirty_max = 0;
-            if (!convert_texture_into(pal_reuse, 0, pal_reuse->h)) {
+            pal_reuse->dirty_n = 0;
+            PROF_ADD(cpal, 1);
+            /* palette changed → whole sheet must re-expand */
+            if (!reconvert_entry(pal_reuse, 1)) {
                 pal_reuse->valid = 0;
                 return NULL;
             }
