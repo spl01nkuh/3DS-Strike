@@ -178,10 +178,12 @@ void startFrame() {
 
 void endFrame() {
     if (s_in_frame) {
-        /* draw the bottom screen within the same GPU frame */
+        /* draw the bottom screen within the same GPU frame. Always clear AND
+         * begin its scene (begin flushes the top batch and makes the bottom
+         * the active target) so no stale framebuffer shows through. */
         C2D_TargetClear(s_bot_target, C2D_Color32(0, 0, 0, 0xFF));
+        C2D_SceneBegin(s_bot_target);
         if (s_have_bot) {
-            C2D_SceneBegin(s_bot_target);
             float iw = (float)s_bot_img.subtex->width;
             float ih = (float)s_bot_img.subtex->height;
             float sx = iw > 0 ? 320.0f / iw : 1.0f;
