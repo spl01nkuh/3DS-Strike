@@ -67,6 +67,8 @@ bool RUNNING = 1;
 
 int c_x, c_y, c_v_x = 1, c_v_y = 1;
 
+extern void showLoadingMessage(const char *msg);
+
 void AcrMain() {
     u16 sw_buff;
     u32 sysinfodisp;
@@ -75,6 +77,10 @@ void AcrMain() {
     debug_print("AcrMain: flInitialize...");
     flInitialize(0, 0);
     debug_print("AcrMain: flInitialize done");
+
+    /* Loading screen — shown now (graphics are up) and held through the asset
+     * load that follows, until the game renders its first frame. */
+    showLoadingMessage("Prepare to strike...");
     flSetRenderState(FLRENDER_BACKCOLOR, 0);
     //flSetDebugMode(0);
     system_init_level = 0;

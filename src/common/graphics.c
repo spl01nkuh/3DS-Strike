@@ -11,6 +11,7 @@
 #include <3ds.h>
 #include <citro2d.h>
 #include <citro3d.h>
+#include <stdlib.h>
 
 #include "ctr/gu_draw.h"
 
@@ -114,6 +115,51 @@ static C3D_RenderTarget *s_bot_target;
 static C2D_SpriteSheet s_bot_sheet;
 static C2D_Image s_bot_img;
 static int s_have_bot;
+
+/* --- on-screen text (loading screen + fatal errors) --------------------- */
+static C2D_TextBuf s_msg_buf;
+
+static void draw_message_frame(const char *msg) {
+    if (!my_gu_init && !s_top_target)
+        return;
+    if (!s_msg_buf)
+        s_msg_buf = C2D_TextBufNew(1024);
+    C2D_TextBufClear(s_msg_buf);
+
+    C2D_Text text;
+    C2D_TextParse(&text, s_msg_buf, msg);
+    C2D_TextOptimize(&text);
+
+    float tw = 0.0f, th = 0.0f;
+    C2D_TextGetDimensions(&text, 0.75f, 0.75f, &tw, &th);
+
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    C2D_TargetClear(s_top_target, C2D_Color32(0, 0, 0, 0xFF));
+    C2D_SceneBegin(s_top_target);
+    C2D_DrawText(&text, C2D_WithColor, (SCREEN_WIDTH - tw) * 0.5f,
+                 (SCREEN_HEIGHT - th) * 0.5f, 0.5f, 0.75f, 0.75f,
+                 C2D_Color32(0xF0, 0xF0, 0xF0, 0xFF));
+    C2D_TargetClear(s_bot_target, C2D_Color32(0, 0, 0, 0xFF));
+    C2D_SceneBegin(s_bot_target);
+    C3D_FrameEnd(0);
+}
+
+void showLoadingMessage(const char *msg) {
+    draw_message_frame(msg);
+}
+
+void fatalMessage(const char *msg) {
+    /* A readable error beats a silent black-screen hang (the old while(1)).
+     * Keep aptMainLoop running so HOME works; START exits to the launcher. */
+    while (aptMainLoop()) {
+        draw_message_frame(msg);
+        hidScanInput();
+        if (hidKeysDown() & (KEY_START | KEY_A | KEY_B))
+            break;
+    }
+    endGu();
+    exit(0);
+}
 
 void initGu() {
     gfxInitDefault();

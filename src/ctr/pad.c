@@ -6,8 +6,11 @@
  *   0x0010 LK(cross)  0x0020 MK(circle)   0x0040 HK(R)
  *   0x8000 start      0x4000 select(coin)
  *
- * 3DS mapping keeps the classic 6-button handheld layout:
- *   Y=LP X=MP L=HP / B=LK A=MK R=HK, d-pad+circle pad = stick.
+ * 3DS mapping (PlayStation face button -> 3DS face button, Nintendo-style so
+ * A=confirm/B=cancel; positions match a PS pad rotated to the Nintendo layout):
+ *   Square(LP)=X  Triangle(MP)=Y  HP=L
+ *   Cross(LK)=A   Circle(MK)=B    HK=R
+ *   d-pad + circle pad = stick.
  */
 #include <3ds.h>
 #include <string.h>
@@ -61,11 +64,11 @@ void tarPADRead(void) {
     if ((held & KEY_DLEFT) || cp.dx < -40) sw |= 0x0004;
     if ((held & KEY_DRIGHT) || cp.dx > 40) sw |= 0x0008;
 
-    if (held & KEY_Y) sw |= 0x0100; /* LP */
-    if (held & KEY_X) sw |= 0x0200; /* MP */
+    if (held & KEY_X) sw |= 0x0100; /* LP = Square */
+    if (held & KEY_Y) sw |= 0x0200; /* MP = Triangle */
     if (held & KEY_L) sw |= 0x0400; /* HP */
-    if (held & KEY_B) sw |= 0x0010; /* LK */
-    if (held & KEY_A) sw |= 0x0020; /* MK */
+    if (held & KEY_A) sw |= 0x0010; /* LK = Cross  (confirm) */
+    if (held & KEY_B) sw |= 0x0020; /* MK = Circle (cancel) */
     if (held & KEY_R) sw |= 0x0040; /* HK */
 
     if (held & KEY_START) sw |= 0x8000;

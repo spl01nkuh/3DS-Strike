@@ -72,6 +72,13 @@ int main(void) {
     /* New 3DS: 804MHz + L2 cache. No-op on Old 3DS. */
     osSetSpeedupEnable(true);
 
+    /* Let the app spawn worker threads on the system core (core 1). Without
+     * this, threadCreate on core 1 fails on real hardware and the audio mixer
+     * (SPU2 + ADX) falls back onto the render core (0), stealing frame time.
+     * 30% of the syscore is plenty for the periodic mix bursts and leaves the
+     * OS its services. No-op-safe if it fails. */
+    APT_SetAppCpuTimeLimit(30);
+
     svcOutputDebugString("[SF3] main: start", sizeof("[SF3] main: start") - 1);
 
     /* Graphics (citro3d) — implemented in common/graphics.c */

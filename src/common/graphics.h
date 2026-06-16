@@ -51,6 +51,12 @@ extern s16 render_mode;
 extern s32 blit_filter;
 extern int RTT_Enabled;
 
+/* Centered on-screen text. showLoadingMessage draws one frame (loading screen);
+ * fatalMessage holds a readable error instead of a silent hang and exits to the
+ * Homebrew Launcher on START/HOME. */
+void showLoadingMessage(const char *msg);
+void fatalMessage(const char *msg);
+
 // functions
 void initGu();
 void endGu();

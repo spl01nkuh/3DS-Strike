@@ -538,8 +538,11 @@ static TexCacheEntry *use_entry(TexCacheEntry *e) {
         reconvert_entry(e, 0); /* full if dirty_n<0, else the tile list */
         e->dirty_n = 0;
         e->check_frame = s_frame_id; /* trust the hook; refresh baseline lazily */
-    } else if (s_frame_id - e->check_frame >= 240) {
-        /* rare safety net for writers we haven't hooked */
+    } else if (s_frame_id - e->check_frame >= 240u + (uint32_t)((e - s_cache) & 0x3F)) {
+        /* Rare safety net for writers we haven't hooked. The per-slot phase
+         * offset (0..63) staggers these checks so textures created on the same
+         * load frame don't all checksum together — that clustering was the
+         * periodic ~50ms frame spike. */
         e->check_frame = s_frame_id;
         uint32_t ds = data_checksum(e->tex_ptr, src_bytes(e->format, e->w, e->h));
         if (ds != e->data_sum) {
@@ -661,6 +664,18 @@ static TexCacheEntry *resolve_texture(void) {
 
 void ctrGuDrawTexQuad(float x1, float y1, float u1, float v1, float x2, float y2, float u2, float v2,
                       uint32_t color) {
+    /* Cull fully off-screen quads before the costly resolve + C2D_DrawImage.
+     * The game keeps submitting sprites that have scrolled out of the 400x240
+     * top screen; drawing them is wasted work. Coords are screen-space. */
+    {
+        float xlo = x1 < x2 ? x1 : x2, xhi = x1 < x2 ? x2 : x1;
+        float ylo = y1 < y2 ? y1 : y2, yhi = y1 < y2 ? y2 : y1;
+        if (xhi <= 0.0f || xlo >= 400.0f || yhi <= 0.0f || ylo >= 240.0f) {
+            s_quad_z_set = 0; /* consume the caller's per-quad z like the normal path */
+            return;
+        }
+    }
+
     TexCacheEntry *e = resolve_texture();
     if (!e)
         return;
@@ -702,11 +717,17 @@ void ctrGuDrawTexQuad(float x1, float y1, float u1, float v1, float x2, float y2
     params.depth = s_quad_z_set ? map_depth(s_quad_z) : 0.95f;
     s_quad_z_set = 0;
 
-    C2D_PlainImageTint(&s_tint, color, 1.0f);
+    /* Skip tint setup for the common untinted (white) case — pass NULL so C2D
+     * draws the image without per-vertex colour modulation. */
+    C2D_ImageTint *tintp = NULL;
+    if (color != 0xFFFFFFFFu) {
+        C2D_PlainImageTint(&s_tint, color, 1.0f);
+        tintp = &s_tint;
+    }
 #if GU_PROFILE
-    { uint64_t _d = svcGetSystemTick(); C2D_DrawImage(img, &params, &s_tint); prof_draw_ticks += svcGetSystemTick() - _d; }
+    { uint64_t _d = svcGetSystemTick(); C2D_DrawImage(img, &params, tintp); prof_draw_ticks += svcGetSystemTick() - _d; }
 #else
-    C2D_DrawImage(img, &params, &s_tint);
+    C2D_DrawImage(img, &params, tintp);
 #endif
 }
 

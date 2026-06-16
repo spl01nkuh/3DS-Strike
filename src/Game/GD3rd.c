@@ -70,11 +70,33 @@ s8* ldreq_process_name[];
 const LDREQ_TBL ldreq_tbl[294];
 const s16 ldreq_ix[43][2];
 
+extern void fatalMessage(const char *msg);
+
 s32 Setup_Directory_Record_Data() {
-    // Init AFS archive — single file, async I/O thread
-    if (!afsInit("resources/SF33RD.AFS")) {
-        flLogOut("AFS init FAILED!\n");
-        while(1) {}
+    // Init AFS archive — try the documented location first, then sensible
+    // fallbacks, so the build boots wherever the user placed their game data.
+    static const char *afs_paths[] = {
+        "resources/SF33RD.AFS",        // sdmc:/3ds/sf3/resources/ (README location)
+        "SF33RD.AFS",                  // sdmc:/3ds/sf3/
+        "sdmc:/3ds/SF33RD.AFS",        // sdmc:/3ds/
+        "sdmc:/SF33RD.AFS",            // SD root
+    };
+    s32 ok = 0;
+    for (u32 i = 0; i < sizeof(afs_paths) / sizeof(afs_paths[0]); i++) {
+        if (afsInit(afs_paths[i])) {
+            flLogOut("AFS init OK: %s\n", afs_paths[i]);
+            ok = 1;
+            break;
+        }
+    }
+    if (!ok) {
+        // Previously while(1){} — a silent black-screen lockup on hardware.
+        // Show a readable message and let the user exit instead.
+        flLogOut("AFS init FAILED on all paths!\n");
+        fatalMessage("Game data not found.\n\n"
+                     "Copy SF33RD.AFS to your SD card at:\n"
+                     "/3ds/sf3/resources/SF33RD.AFS\n\n"
+                     "(then relaunch -- press START to exit)");
     }
 
     /*

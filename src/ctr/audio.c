@@ -204,15 +204,23 @@ int pspAudioInit(void) {
     for (int i = 0; i < NUM_WBUF; i++)
         queue_buffer(i);
 
-    /* Pin the mixer to the system core (1) so the SPU2 tick + ADX decode
-     * run parallel to the render thread on core 0 instead of stealing its
-     * time — recovers the ~2fps the audio work was costing. Falls back to
-     * the default core if core 1 is unavailable. Priority just above main. */
+    /* Keep the SPU2 tick + ADX decode OFF the render core (0) so they run in
+     * parallel instead of stealing frame time (~2fps). New 3DS has free app
+     * cores (2,3); Old 3DS only has the system core (1), usable thanks to
+     * APT_SetAppCpuTimeLimit in main(). Fall back down the chain if needed.
+     * Priority just above main. */
     s32 prio = 0x30;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    s_thread = threadCreate(audio_thread, NULL, 16 * 1024, prio - 1, 1, false);
+    bool isN3DS = false;
+    APT_CheckNew3DS(&isN3DS);
+    int audio_core = isN3DS ? 2 : 1;
+    s_thread = threadCreate(audio_thread, NULL, 16 * 1024, prio - 1, audio_core, false);
+    if (!s_thread && audio_core != 1) {
+        debug_print("audio: core-%d create failed; trying syscore (1)", audio_core);
+        s_thread = threadCreate(audio_thread, NULL, 16 * 1024, prio - 1, 1, false);
+    }
     if (!s_thread) {
-        debug_print("audio: core-1 thread create failed; retrying default core");
+        debug_print("audio: syscore create failed; falling back to render core");
         s_thread = threadCreate(audio_thread, NULL, 16 * 1024, prio - 1, -1, false);
     }
     if (!s_thread)
