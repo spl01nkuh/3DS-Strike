@@ -16,6 +16,11 @@ void EFF23_SUDDENLY(WORK_Other_CONN* /* unused */);
 void Setup_23_Sub(WORK_Other_CONN* ewk);
 void Setup_Letter_23(WORK_Other_CONN* ewk, s16 disp_index);
 
+/* BUTTON CONFIG visual-row -> slot order (defined in menu.c). The main options
+ * config is drawn by this effect; map each on-screen row to its real slot so the
+ * rows read X,Y,R,L,A,B,ZR,ZL while the stored data stays in slot order. */
+extern const u8 Button_Cfg_Order[8];
+
 const s8* Letter_Data_23[4][12] = { { "L.PUNCH",
                                       "M.PUNCH",
                                       "H.PUNCH",
@@ -85,7 +90,9 @@ void effect_23_move(WORK_Other_CONN* ewk) {
     }
 
     if (ewk->wu.type < 8 && ewk->wu.disp_flag) {
-        dispButtonImage(-44, 12, ewk->wu.position_z, 23, 19, ewk->wu.my_clear_level, ewk->wu.type);
+        /* wu.type is the on-screen row; map it to the real button slot so the
+         * glyph matches the custom X,Y,R,L,A,B,ZR,ZL row order. */
+        dispButtonImage(-44, 12, ewk->wu.position_z, 23, 19, ewk->wu.my_clear_level, Button_Cfg_Order[ewk->wu.type]);
     }
 }
 
@@ -185,7 +192,12 @@ s32 effect_23_init(s16 id, u8 dir_old, s16 sync_bg, s16 master_player, s16 lette
 void Setup_23_Sub(WORK_Other_CONN* ewk) {
     switch (ewk->master_priority) {
     case 0:
-        Setup_Letter_23(ewk, Convert_Buff[1][ewk->master_id][ewk->wu.type]);
+        /* The 8 button rows show their function name in the custom row order;
+         * map the on-screen row to its real slot. Row 8 (vibration) is not a
+         * button and passes through unmapped. */
+        Setup_Letter_23(
+            ewk,
+            Convert_Buff[1][ewk->master_id][ewk->wu.type < 8 ? Button_Cfg_Order[ewk->wu.type] : ewk->wu.type]);
         break;
 
     default:

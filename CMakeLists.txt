@@ -130,6 +130,37 @@ else()
     message(STATUS "Bottom-screen image: none (bottom screen will be black)")
 endif()
 
+# Per-character command lists (bottom screen): one PNG per character -> romfs/
+# cmd<charID>.t3x. Add a character by appending "<id>|<filename>" to CMD_LIST.
+set(CMD_DIR "C:/Users/temz1/OneDrive/Documents/sf3 photoshop/finished bottom screen")
+set(CMD_LIST
+    "1|alexbottom screen.png"
+    "14|akuma bottom screen.png"
+    "16|makoto bottom screen.png"
+    "15|chunli bottom screen.png"
+    "4|dudley bottom screen.png"
+    "8|elena bottom screen.png"
+    "6|hugo bottom screen.png")
+set(CMD_T3X_OUTPUTS "")
+foreach(entry ${CMD_LIST})
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 cid)
+    list(GET parts 1 fname)
+    if(EXISTS "${CMD_DIR}/${fname}")
+        add_custom_command(
+            OUTPUT ${ROMFS_DIR}/cmd${cid}.t3x
+            COMMAND ${CTR_TEX3DS_EXE} -o ${ROMFS_DIR}/cmd${cid}.t3x "${CMD_DIR}/${fname}"
+            DEPENDS "${CMD_DIR}/${fname}"
+            COMMENT "Converting ${fname} -> romfs/cmd${cid}.t3x")
+        list(APPEND CMD_T3X_OUTPUTS ${ROMFS_DIR}/cmd${cid}.t3x)
+        message(STATUS "Command image: ${fname} -> cmd${cid}.t3x")
+    endif()
+endforeach()
+if(CMD_T3X_OUTPUTS)
+    add_custom_target(cmd_t3x ALL DEPENDS ${CMD_T3X_OUTPUTS})
+    add_dependencies(${PROJECT_NAME} cmd_t3x)
+endif()
+
 ctr_create_3dsx(${PROJECT_NAME}
     SMDH ${PROJECT_NAME}.smdh
     ROMFS ${ROMFS_DIR}

@@ -44,6 +44,14 @@ typedef struct {
     const void *tex_ptr;
     const void *clut_ptr;
     uint32_t clut_sum;
+    /* Per-entry palette LUT cache. The index->RGBA5551 table depends only on the
+     * palette, so for an animated sheet (reconverted every frame with the palette
+     * unchanged) we rebuild it only when (clut_ptr, clut_sum) changes rather than
+     * on every reconvert. Correct across eviction too: a reused entry whose new
+     * palette matches (ptr+sum) can keep the LUT, since the LUT is palette-only. */
+    uint16_t lut[256];
+    const void *lut_clut;
+    uint32_t lut_sum;
     uint32_t data_sum; /* full content checksum — detects CPU-side melt writes */
     uint32_t check_frame;
     /* Dirty TILE list written by melt hooks. Animation tiles scatter across
@@ -102,6 +110,7 @@ static uint32_t prof_texsolid, prof_colorspr, prof_colortri; /* draw-path mix */
 static uint32_t prof_cfull, prof_ctiles, prof_cpal, prof_ctilecnt; /* conv sources */
 static uint64_t prof_frame_ticks, prof_frame_max, prof_last_tick; /* total frame period */
 static uint64_t prof_draw_ticks; /* time in C2D draw submission */
+static uint64_t prof_conv_prev, prof_conv_fr_max; /* worst single-frame conv (burst) */
 #define PROF_ADD(var, n) (prof_##var += (n))
 #define PROF_TICK_START() uint64_t _t0 = svcGetSystemTick()
 #define PROF_TICK_END(acc) (prof_##acc += svcGetSystemTick() - _t0)
@@ -204,12 +213,15 @@ void ctrGuFrameBegin(void) {
         }
         prof_last_tick = now;
     }
+    /* worst single-frame conversion time in the window (catches super-art bursts) */
+    { uint64_t cf = prof_conv_ticks - prof_conv_prev; prof_conv_prev = prof_conv_ticks;
+      if (cf > prof_conv_fr_max) prof_conv_fr_max = cf; }
     if (++prof_frames >= 60) {
         uint64_t cps = (uint64_t)CPU_TICKS_PER_USEC;
-        debug_print("prof/60f: FRAME avg=%lu max=%lu | conv=%lu(%lu us) csum=%lu(%lu us) draw=%lu us quads=%lu miss=%lu",
+        debug_print("prof/60f: FRAME avg=%lu max=%lu | conv=%lu(%lu us frmax=%lu us) csum=%lu(%lu us) draw=%lu us quads=%lu miss=%lu",
                     (unsigned long)(prof_frame_ticks / cps / 60), (unsigned long)(prof_frame_max / cps),
                     (unsigned long)prof_conv,
-                    (unsigned long)(prof_conv_ticks / cps), (unsigned long)prof_csum,
+                    (unsigned long)(prof_conv_ticks / cps), (unsigned long)(prof_conv_fr_max / cps), (unsigned long)prof_csum,
                     (unsigned long)(prof_csum_ticks / cps), (unsigned long)(prof_draw_ticks / cps),
                     (unsigned long)prof_quads, (unsigned long)prof_misses);
         prof_draw_ticks = 0;
@@ -233,6 +245,7 @@ void ctrGuFrameBegin(void) {
                         (unsigned long)prof_dim_w, (unsigned long)prof_dim_h);
         prof_frames = prof_conv = prof_rows = prof_quads = prof_csum = prof_misses = 0;
         prof_conv_ticks = prof_csum_ticks = 0;
+        prof_conv_prev = prof_conv_fr_max = 0;
         prof_frame_ticks = prof_frame_max = 0;
         memset(prof_fmt, 0, sizeof(prof_fmt));
     }
@@ -357,6 +370,19 @@ static inline uint16_t conv4444(uint16_t c) {
     return (uint16_t)((r << 11) | (g << 6) | (b << 1) | a);
 }
 
+/* Direct (non-paletted) 5551 textures — e.g. the title logo — are stored as
+ * ARGB1555 (A bit15, R 14-10, G 9-5, B 4-0) byte-swapped relative to the PS2
+ * PSMCT16 palette layout. Swap endianness, then read A,R,G,B from the MSB.
+ * NOTE: kept separate from conv5551 so the T8/T4 CLUTs (still PSMCT16) are
+ * unaffected. */
+static inline uint16_t conv5551_direct(uint16_t c) {
+    uint16_t a = (c >> 15) & 1;
+    uint16_t r = (c >> 10) & 0x1F;
+    uint16_t g = (c >> 5) & 0x1F;
+    uint16_t b = c & 0x1F;
+    return (uint16_t)((r << 11) | (g << 6) | (b << 1) | a);
+}
+
 static inline uint32_t morton7(uint32_t x, uint32_t y) {
     return ((x & 1)) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
 }
@@ -403,29 +429,52 @@ static void convert_rect(const ConvCtx *c, int w, int h, int x0, int y0, int x1,
     if (x0 >= x1 || y0 >= y1) return;
     PROF_ADD(rows, ((y1 - y0) * (x1 - x0)) / (w ? w : 1));
 
+    /* Inner loop is unrolled by an 8-pixel Morton tile-column: x0/x1/y0/y1 are
+     * tile-aligned (mult. of 8), so per column we compute one base index and emit
+     * the 4 fixed 2-texel stores at Morton offsets {0,4,16,20}>>1 = {0,2,8,10}.
+     * yb and (x>>3)*64 are even, so the >>1 distributes across the terms. */
     uint32_t *dst32 = (uint32_t *)c->dst;
     if (c->format == GU_PSM_T4 && c->t4lut) {
+        const uint32_t *lut = c->t4lut;
         for (int y = y0; y < y1; y++) {
             const uint8_t *row = c->src + y * c->row_bytes;
-            uint32_t yb = ((uint32_t)y >> 3) * c->tiles_w * 64 + s_my[y & 7];
-            for (int x = x0; x < x1; x += 2)
-                dst32[(yb + ((uint32_t)x >> 3) * 64 + s_mx[x & 7]) >> 1] = c->t4lut[row[x >> 1]];
+            uint32_t yb = (((uint32_t)y >> 3) * c->tiles_w * 64 + s_my[y & 7]) >> 1;
+            for (int x = x0; x < x1; x += 8) {
+                uint32_t b = yb + ((uint32_t)x >> 3) * 32;
+                const uint8_t *r = row + (x >> 1);
+                dst32[b]      = lut[r[0]];
+                dst32[b + 2]  = lut[r[1]];
+                dst32[b + 8]  = lut[r[2]];
+                dst32[b + 10] = lut[r[3]];
+            }
         }
     } else if (c->format == GU_PSM_T8 && c->pal5551) {
+        const uint16_t *pal = c->pal5551;
         for (int y = y0; y < y1; y++) {
             const uint8_t *row = c->src + y * c->row_bytes;
-            uint32_t yb = ((uint32_t)y >> 3) * c->tiles_w * 64 + s_my[y & 7];
-            for (int x = x0; x < x1; x += 2)
-                dst32[(yb + ((uint32_t)x >> 3) * 64 + s_mx[x & 7]) >> 1] =
-                    (uint32_t)c->pal5551[row[x]] | ((uint32_t)c->pal5551[row[x + 1]] << 16);
+            uint32_t yb = (((uint32_t)y >> 3) * c->tiles_w * 64 + s_my[y & 7]) >> 1;
+            for (int x = x0; x < x1; x += 8) {
+                uint32_t b = yb + ((uint32_t)x >> 3) * 32;
+                const uint8_t *r = row + x;
+                dst32[b]      = (uint32_t)pal[r[0]] | ((uint32_t)pal[r[1]] << 16);
+                dst32[b + 2]  = (uint32_t)pal[r[2]] | ((uint32_t)pal[r[3]] << 16);
+                dst32[b + 8]  = (uint32_t)pal[r[4]] | ((uint32_t)pal[r[5]] << 16);
+                dst32[b + 10] = (uint32_t)pal[r[6]] | ((uint32_t)pal[r[7]] << 16);
+            }
         }
     } else if (c->dlut) {
+        const uint16_t *dlut = c->dlut;
         for (int y = y0; y < y1; y++) {
             const uint16_t *row16 = (const uint16_t *)(c->src + y * c->row_bytes);
-            uint32_t yb = ((uint32_t)y >> 3) * c->tiles_w * 64 + s_my[y & 7];
-            for (int x = x0; x < x1; x += 2)
-                dst32[(yb + ((uint32_t)x >> 3) * 64 + s_mx[x & 7]) >> 1] =
-                    (uint32_t)c->dlut[row16[x]] | ((uint32_t)c->dlut[row16[x + 1]] << 16);
+            uint32_t yb = (((uint32_t)y >> 3) * c->tiles_w * 64 + s_my[y & 7]) >> 1;
+            for (int x = x0; x < x1; x += 8) {
+                uint32_t b = yb + ((uint32_t)x >> 3) * 32;
+                const uint16_t *r = row16 + x;
+                dst32[b]      = (uint32_t)dlut[r[0]] | ((uint32_t)dlut[r[1]] << 16);
+                dst32[b + 2]  = (uint32_t)dlut[r[2]] | ((uint32_t)dlut[r[3]] << 16);
+                dst32[b + 8]  = (uint32_t)dlut[r[4]] | ((uint32_t)dlut[r[5]] << 16);
+                dst32[b + 10] = (uint32_t)dlut[r[6]] | ((uint32_t)dlut[r[7]] << 16);
+            }
         }
     }
 }
@@ -461,20 +510,26 @@ static int reconvert_entry(TexCacheEntry *e, int full) {
         if (swz) { psp_unswizzle(swz, c.src, c.row_bytes, h); c.src = swz; }
     }
 
-    static uint16_t pal5551[256];
     static uint32_t t4lut[256];
     const uint16_t *pal = (const uint16_t *)e->clut_ptr;
     if ((e->format == GU_PSM_T4 || e->format == GU_PSM_T8) && pal) {
         int pal_count = (e->format == GU_PSM_T4) ? 16 : 256;
-        /* CPS3 colorkey: index 0 transparent (keep palette alpha), all other
-         * indices forced opaque so alpha test doesn't tear glyphs/sprites. */
-        pal5551[0] = conv5551(pal[0]);
-        for (int i = 1; i < pal_count; i++)
-            pal5551[i] = conv5551(pal[i]) | 1u;
-        c.pal5551 = pal5551;
+        /* Rebuild the index->RGBA LUT only when the palette changed since we last
+         * built it for this entry — animated sheets reconvert every frame with an
+         * unchanged palette, so this skips ~256 conversions per reconvert. CPS3
+         * colorkey: index 0 transparent (keep palette alpha), all others forced
+         * opaque so the alpha test doesn't tear glyphs/sprites. */
+        if (e->lut_clut != pal || e->lut_sum != e->clut_sum) {
+            e->lut[0] = conv5551(pal[0]);
+            for (int i = 1; i < pal_count; i++)
+                e->lut[i] = conv5551(pal[i]) | 1u;
+            e->lut_clut = pal;
+            e->lut_sum = e->clut_sum;
+        }
+        c.pal5551 = e->lut;
         if (e->format == GU_PSM_T4) {
             for (int b = 0; b < 256; b++)
-                t4lut[b] = (uint32_t)pal5551[b & 0xF] | ((uint32_t)pal5551[b >> 4] << 16);
+                t4lut[b] = (uint32_t)e->lut[b & 0xF] | ((uint32_t)e->lut[b >> 4] << 16);
             c.t4lut = t4lut;
         }
     } else if (e->format != GU_PSM_T4 && e->format != GU_PSM_T8) {
@@ -483,7 +538,7 @@ static int reconvert_entry(TexCacheEntry *e, int full) {
             s_lut4444 = (uint16_t *)malloc(65536 * sizeof(uint16_t));
             if (s_lut5551 && s_lut4444)
                 for (int v = 0; v < 65536; v++) {
-                    s_lut5551[v] = conv5551((uint16_t)v);
+                    s_lut5551[v] = conv5551_direct((uint16_t)v);
                     s_lut4444[v] = conv4444((uint16_t)v);
                 }
         }
@@ -508,12 +563,40 @@ static int reconvert_entry(TexCacheEntry *e, int full) {
     return 1;
 }
 
+/* Free the C3D_Tex of the least-recently-used cached entry (other than `keep`)
+ * that isn't needed by this frame's deferred draws, to reclaim texture memory
+ * when C3D_TexInit runs out. Returns 1 if one was freed. */
+static int free_lru_texture(TexCacheEntry *keep) {
+    TexCacheEntry *victim = NULL;
+    for (int i = 0; i < TEXCACHE_SIZE; i++) {
+        TexCacheEntry *e = &s_cache[i];
+        if (e == keep || !e->tex_alive || e->drawn_frame == s_frame_id)
+            continue;
+        if (!victim || e->last_use < victim->last_use)
+            victim = e;
+    }
+    if (!victim)
+        return 0;
+    C3D_TexDelete(&victim->tex);
+    victim->tex_alive = 0;
+    victim->valid = 0; /* slot reusable; re-convert from source if needed again */
+    victim->dirty_n = 0;
+    return 1;
+}
+
 /* allocate (or reuse) + fill a native texture for a cache entry */
 static int convert_texture(TexCacheEntry *e) {
     if (!e->tex_alive) {
-        if (!C3D_TexInit(&e->tex, (u16)e->w, (u16)e->h, GPU_RGBA5551)) {
-            debug_print("gu_draw: C3D_TexInit %dx%d FAILED", e->w, e->h);
-            return 0;
+        /* The 3DS has far less texture memory than this 256-entry cache can ask
+         * for when many large (256x256) sheets coexist — the opening montage
+         * exhausts it, and failed allocations render whole screens blank. On
+         * failure, free LRU textures to reclaim memory and retry instead of
+         * giving up (which is what produced the blank/missing opening frames). */
+        while (!C3D_TexInit(&e->tex, (u16)e->w, (u16)e->h, GPU_RGBA5551)) {
+            if (!free_lru_texture(e)) {
+                debug_print("gu_draw: C3D_TexInit %dx%d FAILED (no texture memory)", e->w, e->h);
+                return 0;
+            }
         }
         C3D_TexSetFilter(&e->tex, GPU_NEAREST, GPU_NEAREST);
         C3D_TexSetWrap(&e->tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
@@ -532,8 +615,18 @@ static int convert_texture(TexCacheEntry *e) {
     return 1;
 }
 
+/* DIAG toggle: when 1, rebuild the entire sheet from srcRam on every bind,
+ * bypassing the per-tile dirty/notify path — bisects per-tile mapping bugs
+ * (artifacts gone) vs. melt/source/conversion bugs (artifacts remain). */
+#define GU_DIAG_FULL_RECONVERT 0
+
 /* a cache entry matched the bind: reconvert dirty tiles if needed, mark used */
 static TexCacheEntry *use_entry(TexCacheEntry *e) {
+#if GU_DIAG_FULL_RECONVERT
+    reconvert_entry(e, 1);
+    e->dirty_n = 0;
+    e->check_frame = s_frame_id;
+#else
     if (e->dirty_n != 0) {
         reconvert_entry(e, 0); /* full if dirty_n<0, else the tile list */
         e->dirty_n = 0;
@@ -550,6 +643,7 @@ static TexCacheEntry *use_entry(TexCacheEntry *e) {
             reconvert_entry(e, 1);
         }
     }
+#endif
     e->last_use = ++s_use_counter;
     e->drawn_frame = s_frame_id;
     return e;
@@ -559,21 +653,35 @@ static TexCacheEntry *resolve_texture(void) {
     if (!s_gu.tex_ptr)
         return NULL;
 
-    /* Palette checksum is the per-quad hot cost (256 entries for T8).
-     * Palettes are stable within a frame, so memoize per (clut_ptr, frame)
-     * instead of re-hashing for every sprite that shares a palette. */
+    /* Palette checksum is the per-quad hot cost (256 entries for T8). This used
+     * to be memoized per (clut_ptr, frame) on the assumption that a palette is
+     * stable within a frame. It isn't: the game reuses a single CLUT buffer and
+     * reloads it MID-FRAME, so the memo handed back a stale checksum and the next
+     * sprite matched an old (often not-yet-loaded, all-black) palette variant
+     * already in the cache -> "black boxes throughout the game". Always hash the
+     * live palette so a reloaded CLUT is detected immediately and gets its own
+     * cache entry. (Memoize only across consecutive identical pointers+contents.) */
     static const void *memo_clut;
-    static uint32_t memo_sum, memo_frame = ~0u;
+    static uint32_t memo_sum;
+    static uint16_t memo_fp0, memo_fp1, memo_fp2;
     uint32_t sum;
     if (s_gu.format == GU_PSM_T4 || s_gu.format == GU_PSM_T8) {
-        if (s_gu.clut_ptr == memo_clut && memo_frame == s_frame_id) {
+        int pal_count = (s_gu.format == GU_PSM_T4) ? 16 : 256;
+        const uint16_t *p = (const uint16_t *)s_gu.clut_ptr;
+        if (!p) {
+            sum = 0;
+        } else if (p == memo_clut && p[0] == memo_fp0 && p[pal_count / 2] == memo_fp1 &&
+                   p[pal_count - 1] == memo_fp2) {
+            /* same pointer AND a spread-out fingerprint still matches -> the
+             * buffer hasn't been reloaded since we last hashed it. */
             sum = memo_sum;
         } else {
-            int pal_count = (s_gu.format == GU_PSM_T4) ? 16 : 256;
-            sum = s_gu.clut_ptr ? clut_checksum(s_gu.clut_ptr, pal_count) : 0;
-            memo_clut = s_gu.clut_ptr;
+            sum = clut_checksum(p, pal_count);
+            memo_clut = p;
             memo_sum = sum;
-            memo_frame = s_frame_id;
+            memo_fp0 = p[0];
+            memo_fp1 = p[pal_count / 2];
+            memo_fp2 = p[pal_count - 1];
         }
     } else {
         sum = 0;
@@ -724,11 +832,10 @@ void ctrGuDrawTexQuad(float x1, float y1, float u1, float v1, float x2, float y2
         C2D_PlainImageTint(&s_tint, color, 1.0f);
         tintp = &s_tint;
     }
-#if GU_PROFILE
-    { uint64_t _d = svcGetSystemTick(); C2D_DrawImage(img, &params, tintp); prof_draw_ticks += svcGetSystemTick() - _d; }
-#else
+    /* No per-quad svcGetSystemTick timing here: at ~300 quads/frame the two
+     * syscalls per call dwarfed the work being measured. Frame avg/max + the
+     * per-batch conv/csum timers give an accurate picture without the skew. */
     C2D_DrawImage(img, &params, tintp);
-#endif
 }
 
 void ctrGuDrawRectSolid(float x, float y, float w, float h, uint32_t color) {
@@ -763,6 +870,39 @@ void ctrGuDrawCropBars(float off_x, float off_y) {
         C2D_DrawRectSolid(0.0f, 0.0f, z, SW, off_y, black);       /* top    */
         C2D_DrawRectSolid(0.0f, SH - off_y, z, SW, off_y, black); /* bottom */
     }
+}
+
+/* Draw a simple lettered button glyph (light disc + dark label) filling the
+ * given screen-space rect — replaces the PlayStation button sprites so prompts
+ * read as Nintendo controls. label is a short string ("A","B","X","Y","L"...). */
+void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label) {
+    if (x1 < x0) { float t = x0; x0 = x1; x1 = t; }
+    if (y1 < y0) { float t = y0; y0 = y1; y1 = t; }
+    float w = x1 - x0, h = y1 - y0;
+    float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+    float r = (w < h ? w : h) * 0.5f * 0.80f; /* margin so the disc sits a bit smaller than its cell */
+    if (r < 3.0f) return;
+    const float z = 0.95f;
+
+    s_blend_mode = 0x32; /* standard alpha so the disc is opaque */
+    apply_blend();
+
+    /* thin white outline so the black disc stays visible on dark backgrounds,
+     * flat black face (no gradient), white letter — Nintendo button look */
+    C2D_DrawCircleSolid(cx, cy, z, r, C2D_Color32(0xFF, 0xFF, 0xFF, 0xFF));         /* outline */
+    C2D_DrawCircleSolid(cx, cy, z, r * 0.86f, C2D_Color32(0x00, 0x00, 0x00, 0xFF)); /* black face */
+
+    static C2D_TextBuf gbuf;
+    if (!gbuf) gbuf = C2D_TextBufNew(32);
+    C2D_TextBufClear(gbuf);
+    C2D_Text txt;
+    C2D_TextParse(&txt, gbuf, label);
+    C2D_TextOptimize(&txt);
+    float scale = (2.0f * r) / 40.0f;
+    float tw = 0.0f, th = 0.0f;
+    C2D_TextGetDimensions(&txt, scale, scale, &tw, &th);
+    C2D_DrawText(&txt, C2D_WithColor, cx - tw * 0.5f, cy - th * 0.5f, z, scale, scale,
+                 C2D_Color32(0xFF, 0xFF, 0xFF, 0xFF));
 }
 
 /* --------------------------------------------- GU entry points (fl.c) -- */

@@ -74,9 +74,12 @@ void tarPADRead(void) {
     if (held & KEY_START) sw |= 0x8000;
     if (held & KEY_SELECT) sw |= 0x4000;
 
-    /* New 3DS extras: ZL/ZR as 3xP / 3xK macro buttons */
-    if (held & KEY_ZL) sw |= 0x0100 | 0x0200 | 0x0400;
-    if (held & KEY_ZR) sw |= 0x0010 | 0x0020 | 0x0040;
+    /* New 3DS extras: ZL/ZR drive the game's two otherwise-unreachable config
+     * slots (SWK_LEFT_SHOULDER / SWK_LEFT_TRIGGER -> Shot[3] / Shot[7]) so they
+     * show up as fully remappable buttons in BUTTON CONFIG. They default to
+     * 3P / 3K (see Setup_IO_ConvDataDefault in SYS_sub.c). */
+    if (held & KEY_ZL) sw |= 0x0080; /* SWK_LEFT_SHOULDER -> Shot[3] (default 3P) */
+    if (held & KEY_ZR) sw |= 0x0800; /* SWK_LEFT_TRIGGER  -> Shot[7] (default 3K) */
 
     tp->sw = sw;
 

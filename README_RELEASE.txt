@@ -34,20 +34,39 @@ On your SD card:
 Then launch "SFIII 3rd Strike" from the Homebrew Launcher.
 
 ----------------------------------------------------------------
- CONTROLS (in-game)
+ CONTROLS
 ----------------------------------------------------------------
-  D-Pad / Circle Pad ...... move
-  Y / X / L ............... Light / Medium / Heavy Punch
-  B / A / R ............... Light / Medium / Heavy Kick
-  ZL ...................... 3x Punch     ZR ...... 3x Kick   (New 3DS)
-  START ................... start / pause     SELECT ... coin
+ Menus:  A = confirm     B = cancel
+         On-screen prompts now show Nintendo buttons (A/B/X/Y/L/R/ZL/ZR).
+
+ In a fight (default layout -- fully remappable, see below):
+   D-Pad / Circle Pad ...... move
+   X / Y / L ............... Light / Medium / Heavy Punch
+   A / B / R ............... Light / Medium / Heavy Kick
+   ZL / ZR ................. 3x Punch / 3x Kick      (New 3DS)
+   START ................... start / pause
+   SELECT ................. coin / insert credit
+
+ Rebind any button in  OPTION -> BUTTON CONFIG.  ZL and ZR are now
+ fully assignable too (not just fixed macros). Your layout is saved.
+
+----------------------------------------------------------------
+ NEW IN THIS BUILD
+----------------------------------------------------------------
+- SAVING: settings, button config, options, rankings and unlock
+  progress now persist to your SD card and survive a reboot
+  (stored at /3ds/sf3/SETTINGS.BIN -- created automatically).
+- Nintendo button glyphs on all on-screen prompts.
+- ZL / ZR are fully remappable in BUTTON CONFIG.
+- Smoother pause-menu audio (the muffle is no longer harsh/lo-fi).
 
 ----------------------------------------------------------------
  NOTES / KNOWN ISSUES
 ----------------------------------------------------------------
 - New 3DS runs best. Old 3DS is playable; very busy stages may dip below 60fps.
 - Sound requires dspfirm.cdc (see above).
-- A few minor visual effects are still being polished.
+- One attract-screen opening effect (text dissolving into squares) still
+  shows minor artifacts. Gameplay and menus are unaffected.
 
 ----------------------------------------------------------------
  CREDITS

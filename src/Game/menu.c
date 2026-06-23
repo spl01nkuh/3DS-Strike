@@ -1,6 +1,7 @@
 #include "Game/menu.h"
 #include "common.h"
 #include "common/graphics.h"
+#include "Game/IOConv.h"
 #include "Game/DIR_DATA.h"
 #include "Game/EFF10.h"
 #include "Game/EFF45.h"
@@ -476,13 +477,15 @@ void toSelectGame(struct _TASK* task_ptr) {
 
     case 3:
         imgSelectGameButton();
-        sw = (~plsw_01[0] & plsw_00[0]) | (~plsw_01[1] & plsw_00[1]); // potential macro
-        sw &= (SWK_SOUTH | SWK_EAST);
+        /* Use RAW newly-pressed buttons (io_w.*.sw_new), not the post-config
+         * plsw_00 — so Yes/No are FIXED physical buttons no matter how the
+         * player has remapped their config: A = Yes (quit), B = No (cancel). */
+        sw = (io_w.data[0].sw_new | io_w.data[1].sw_new) & (SWK_WEST | SWK_NORTH);
 
         if (sw != 0) {
-            if (sw != (SWK_SOUTH | SWK_EAST)) {
-                if (sw & SWK_SOUTH) {
-                    task_ptr->free[0] = 1;
+            if (sw != (SWK_WEST | SWK_NORTH)) {
+                if (sw & SWK_WEST) {
+                    task_ptr->free[0] = 1; /* A pressed -> Yes (quit) */
                 }
 
                 SE_selected();
@@ -533,8 +536,8 @@ void toSelectGame(struct _TASK* task_ptr) {
 }
 
 void imgSelectGameButton() {
-    dispButtonImage2(0x74, 0x6B, 0x18, 0x20, 0x1A, 0, 4);
-    dispButtonImage2(0xB2, 0x6B, 0x18, 0x20, 0x1A, 0, 5);
+    dispButtonImage2(0x74, 0x6B, 0x18, 0x20, 0x1A, 0, 0); /* A = Yes */
+    dispButtonImage2(0xB2, 0x6B, 0x18, 0x20, 0x1A, 0, 1); /* B = No  */
 }
 
 void Training_Mode(struct _TASK* task_ptr) {
@@ -1533,6 +1536,11 @@ void Load_Replay_Sub(struct _TASK* task_ptr) {
             Push_LDREQ_Queue_Player(0, My_char[0]);
             Push_LDREQ_Queue_Player(1, My_char[1]);
             Push_LDREQ_Queue_BG((u16)bg_w.stage);
+            /* Preload the whole match (both fighters + stage) now, during the
+             * post-select fade-out, so the round starts with content already in
+             * RAM instead of streaming it in (the AFS reads block the main
+             * thread ~8-32ms each — the in-fight stutter). */
+            { extern void Drain_LDREQ_Queue(void); Drain_LDREQ_Queue(); }
         }
 
         break;
@@ -1860,8 +1868,17 @@ void Button_Config_Sub(s16 PL_id) {
     }
 }
 
+/* BUTTON CONFIG visual row order. The game stores the 8 buttons in slot order
+ * (A,B,R,ZL,X,Y,L,ZR); this table maps each on-screen row (top to bottom) to its
+ * underlying slot so the menu reads A,B,R,L,X,Y,ZR,ZL. Used here (editing) and in
+ * EFF10.c (drawing the glyph + function name). Rows 8/9/10 = vibration/default/
+ * exit are not buttons and bypass this table. */
+const u8 Button_Cfg_Order[8] = { 0, 1, 2, 6, 4, 5, 7, 3 };
+
 void Button_Move_Sub_LR(u16 sw, s16 cursor_id) {
     s16 max;
+    s16 slot = (Menu_Cursor_Y[cursor_id] < 8) ? Button_Cfg_Order[Menu_Cursor_Y[cursor_id]]
+                                              : Menu_Cursor_Y[cursor_id];
 
     switch (Menu_Cursor_Y[cursor_id]) {
     case 8:
@@ -1884,10 +1901,10 @@ void Button_Move_Sub_LR(u16 sw, s16 cursor_id) {
 
     switch (sw) {
     case 4:
-        Convert_Buff[1][cursor_id][Menu_Cursor_Y[cursor_id]] -= 1;
+        Convert_Buff[1][cursor_id][slot] -= 1;
 
-        if (Convert_Buff[1][cursor_id][Menu_Cursor_Y[cursor_id]] < 0) {
-            Convert_Buff[1][cursor_id][Menu_Cursor_Y[cursor_id]] = max;
+        if (Convert_Buff[1][cursor_id][slot] < 0) {
+            Convert_Buff[1][cursor_id][slot] = max;
         }
 
         if (Menu_Cursor_Y[cursor_id] == 8) {
@@ -1902,13 +1919,13 @@ void Button_Move_Sub_LR(u16 sw, s16 cursor_id) {
         break;
 
     case 8:
-        Convert_Buff[1][cursor_id][Menu_Cursor_Y[cursor_id]] += 1;
+        Convert_Buff[1][cursor_id][slot] += 1;
 
-        if (Convert_Buff[1][cursor_id][Menu_Cursor_Y[cursor_id]] > max) {
-            Convert_Buff[1][cursor_id][Menu_Cursor_Y[cursor_id]] = 0;
+        if (Convert_Buff[1][cursor_id][slot] > max) {
+            Convert_Buff[1][cursor_id][slot] = 0;
         }
 
-        if ((Menu_Cursor_Y[cursor_id] == 8) && (Convert_Buff[1][cursor_id][Menu_Cursor_Y[cursor_id]] == 1)) {
+        if ((Menu_Cursor_Y[cursor_id] == 8) && (Convert_Buff[1][cursor_id][slot] == 1)) {
             pp_vib_on(cursor_id);
         }
 

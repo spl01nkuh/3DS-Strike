@@ -2263,6 +2263,19 @@ const u8 scrnAddTex1UV[9][4] = { { 96, 0, 32, 32 },  { 63, 0, 32, 32 },  { 0, 96
                                  { 0, 64, 32, 32 },  { 0, 0, 32, 32 },   { 31, 0, 32, 32 },
                                  { 32, 96, 32, 32 }, { 32, 64, 32, 32 }, { 128, 0, 96, 128 } };
 
+/* Button-sprite index -> the 3DS key that drives that config slot. The index
+ * matches the game's Shot[] slot order (and the scrnAddTex1UV sprite sheet):
+ *   0 WEST(A)   1 NORTH(B)  2 R_SHOULDER(R) 3 L_SHOULDER(ZL)
+ *   4 SOUTH(X)  5 EAST(Y)   6 R_TRIGGER(L)  7 L_TRIGGER(ZR)
+ * pad.c binds each 3DS key onto these SWK bits, so prompts read correctly too:
+ * imgSelectGameButton draws ix4/ix5, the SWK_SOUTH/SWK_EAST prompts -> X/Y.
+ * NULL keeps the original art (the big controller diagram at ix 8). */
+extern void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label);
+static const char *sf3_btn_label(s32 ix) {
+    static const char *const tbl[8] = { "A", "B", "R", "ZL", "X", "Y", "L", "ZR" };
+    return (ix >= 0 && ix < 8) ? tbl[ix] : NULL;
+}
+
 void dispButtonImage(s32 px, s32 py, s32 pz, s32 sx, s32 sy, s32 cl, s32 ix) {
     if(DEMMA_DEBUG || skip_frame)
         return;
@@ -2293,6 +2306,13 @@ void dispButtonImage(s32 px, s32 py, s32 pz, s32 sx, s32 sy, s32 cl, s32 ix) {
     for(int i = 0; i < 2; i++){
         vertices[i].x = SCALE_X(vecs[i].x);
         vertices[i].y = SCALE_Y(vecs[i].y);
+    }
+    {
+        const char *glyph = sf3_btn_label(ix);
+        if (glyph) {
+            ctrDrawButtonGlyph(vertices[0].x, vertices[0].y, vertices[1].x, vertices[1].y, glyph);
+            return;
+        }
     }
     vertices[0].z = vertices[1].z = PrioBase[pz];
     vertices[0].u = ((scrnAddTex1UV[ix][0] / 256.0f) * tex->width);
@@ -2326,6 +2346,13 @@ void dispButtonImage2(s32 px, s32 py, s32 pz, s32 sx, s32 sy, s32 cl, s32 ix) {
     vertices[0].y = SCALE_Y(py);
     vertices[1].x = SCALE_X(px + sx);
     vertices[1].y = SCALE_Y(py + sy);
+    {
+        const char *glyph = sf3_btn_label(ix);
+        if (glyph) {
+            ctrDrawButtonGlyph(vertices[0].x, vertices[0].y, vertices[1].x, vertices[1].y, glyph);
+            return;
+        }
+    }
     vertices[0].z = vertices[1].z = PrioBase[pz];
     vertices[0].u = ((scrnAddTex1UV[ix][0] / 256.0f) * tex->width);
     vertices[1].u = (((scrnAddTex1UV[ix][0] + scrnAddTex1UV[ix][2]) / 256.0f) * tex->width);

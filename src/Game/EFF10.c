@@ -7,6 +7,10 @@
 
 const u8 Contents_Check_Data[8] = { 0, 0, 1, 1, 0, 0, 0, 0 };
 
+/* BUTTON CONFIG visual-row -> slot order (defined in menu.c). Lets the config
+ * show rows as X,Y,R,L,A,B,ZR,ZL while the data stays in slot order. */
+extern const u8 Button_Cfg_Order[8];
+
 const s8* button_string_data[8][12] = {
     { "CONTINUE",
       "BUTTON CONFIG.",
@@ -73,14 +77,20 @@ void effect_10_move(WORK_Other* ewk) {
     }
 
     if (Contents_Check_Data[ewk->wu.type] == 1) {
-        ix = Convert_Buff[1][ewk->master_id][ewk->master_priority];
+        /* Type 2 = button-function names, shown in the custom row order; map the
+         * visual row (master_priority) to the real slot. Type 3 = vibration, not
+         * a button row, so it passes through unmapped. */
+        s16 cfg_slot = (ewk->wu.type == 2) ? Button_Cfg_Order[ewk->master_priority] : ewk->master_priority;
+        ix = Convert_Buff[1][ewk->master_id][cfg_slot];
     } else {
         ix = ewk->wu.cg_type;
     }
 
     if (ewk->wu.type == 5) {
+        /* ix is the visual row here; map it to the real button slot so the glyph
+         * matches the custom X,Y,R,L,A,B,ZR,ZL order. */
         dispButtonImage2(
-            (ewk->wu.xyz[0].disp.pos * 8) - 6, (ewk->wu.xyz[1].disp.pos * 8) - 5, 1, 22, 17, 0, ix + correct_index);
+            (ewk->wu.xyz[0].disp.pos * 8) - 6, (ewk->wu.xyz[1].disp.pos * 8) - 5, 1, 22, 17, 0, Button_Cfg_Order[ix]);
         return;
     }
 

@@ -241,11 +241,11 @@ void AcrMain() {
 
         //if(!DEMMA_DEBUG)
             //drawRect(c_x, c_y, 10, 10, 0xFFFFFFFF);
-        
+
         njdp2d_draw_0();
 
         render_end();
-    
+
         sysinfodisp = 0;
 
         if (Debug_w[2] == 2) {
@@ -380,6 +380,14 @@ void njUserInit() {
     zlib_Initialize(mppMalloc(0x10000), 0x10000);
     size = flGetSpace();
     mpp_w.ramcntBuff = mppMalloc(size);
+    /* 3DS: the PSP/PS2 build effectively ran on zero-initialized RAM, and parts
+     * of the engine rely on their ramcnt-pool memory starting at 0 for tiles
+     * they never explicitly write — notably the MTRANS melt-transition sheets
+     * (texcash.c), whose "cut into squares" dissolves leave un-touched tiles to
+     * read as transparent index 0. The 3DS allocator returns dirty memory, which
+     * showed up as garbage / white-block / missing-tile artifacts in the opening
+     * dissolves. Clear the whole pool once so the 3DS matches the PSP's state. */
+    work_init_zero((s32 *)mpp_w.ramcntBuff, size);
     Init_ram_control_work(mpp_w.ramcntBuff, size);
 
     for (i = 0; i < 0x14; i++) {

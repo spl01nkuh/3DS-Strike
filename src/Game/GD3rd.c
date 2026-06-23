@@ -513,6 +513,16 @@ s32 Check_LDREQ_Clear() {
     return q_ldreq->be == 0 && q_ldreq[1].be == 0;
 }
 
+/* Synchronously drain the load queue. Used at the post-select fade-out to
+ * preload a match's fighters + stage before the round starts, instead of
+ * letting the (main-thread, blocking) reads stall the first seconds of the
+ * fight. Iteration-capped so a failed/stuck load can't hang the game. */
+void Drain_LDREQ_Queue(void) {
+    s32 guard = 0;
+    while (!Check_LDREQ_Clear() && guard++ < 20000)
+        Check_LDREQ_Queue();
+}
+
 s32 Check_LDREQ_Queue_Player(s16 id) {
     s16 i;
     s16 kara;

@@ -116,6 +116,17 @@ static C2D_SpriteSheet s_bot_sheet;
 static C2D_Image s_bot_img;
 static int s_have_bot;
 
+/* Per-character command-list artwork on the bottom screen, indexed by character
+ * id (Alex=1, Akuma=14, Makoto=16, ...). Only ids with a romfs:/cmdN.t3x load. */
+#define CMD_CHAR_MAX 20
+static C2D_SpriteSheet s_cmd_sheet[CMD_CHAR_MAX];
+static C2D_Image s_cmd_img[CMD_CHAR_MAX];
+static int s_cmd_have[CMD_CHAR_MAX];
+extern u8 My_char[2]; /* My_char[0] = P1's CONFIRMED character id (set on the confirm button) */
+extern u8 G_No[4];    /* top-level scene; G_No[0]==2 = char-select + match, else menus/title */
+extern s8 Cursor_X[2], Cursor_Y[2]; /* P1 character-select grid cursor */
+extern s8 ID_of_Face[3][8];         /* select grid -> character id (-1 = empty cell) */
+
 /* --- on-screen text (loading screen + fatal errors) --------------------- */
 static C2D_TextBuf s_msg_buf;
 
@@ -179,6 +190,15 @@ void initGu() {
             s_bot_img = C2D_SpriteSheetGetImage(s_bot_sheet, 0);
             s_have_bot = 1;
         }
+        for (int id = 0; id < CMD_CHAR_MAX; id++) {
+            char path[24];
+            snprintf(path, sizeof(path), "romfs:/cmd%d.t3x", id);
+            s_cmd_sheet[id] = C2D_SpriteSheetLoad(path);
+            if (s_cmd_sheet[id] && C2D_SpriteSheetCount(s_cmd_sheet[id]) > 0) {
+                s_cmd_img[id] = C2D_SpriteSheetGetImage(s_cmd_sheet[id], 0);
+                s_cmd_have[id] = 1;
+            }
+        }
     }
 
     ctrGuInit();
@@ -234,12 +254,31 @@ void endFrame() {
          * the active target) so no stale framebuffer shows through. */
         C2D_TargetClear(s_bot_target, C2D_Color32(0, 0, 0, 0xFF));
         C2D_SceneBegin(s_bot_target);
-        if (s_have_bot) {
-            float iw = (float)s_bot_img.subtex->width;
-            float ih = (float)s_bot_img.subtex->height;
+        C2D_Image *bimg = NULL;
+        /* G_No[1]: 0 = title/attract (auto-demo), 1 = character-select, 2 = match.
+         * Show only during select + match: at select preview the HOVERED character
+         * (cursor) so it appears on hover; in the match use the confirmed
+         * My_char[0] so it persists. The attract/title (G_No[1]==0) and menus
+         * (G_No[0]!=2) fall back to the default artwork. */
+        if (G_No[0] == 2 && (G_No[1] == 1 || G_No[1] == 2)) {
+            s16 c;
+            if (G_No[1] == 1) {
+                s8 cy = Cursor_Y[0], cx = Cursor_X[0];
+                c = (cy >= 0 && cy < 3 && cx >= 0 && cx < 8) ? ID_of_Face[cy][cx] : -1;
+            } else {
+                c = (s16)My_char[0];
+            }
+            if (c >= 0 && c < CMD_CHAR_MAX && s_cmd_have[c])
+                bimg = &s_cmd_img[c];
+        }
+        if (!bimg && s_have_bot)
+            bimg = &s_bot_img;
+        if (bimg) {
+            float iw = (float)bimg->subtex->width;
+            float ih = (float)bimg->subtex->height;
             float sx = iw > 0 ? 320.0f / iw : 1.0f;
             float sy = ih > 0 ? 240.0f / ih : 1.0f;
-            C2D_DrawImageAt(s_bot_img, 0.0f, 0.0f, 0.0f, NULL, sx, sy);
+            C2D_DrawImageAt(*bimg, 0.0f, 0.0f, 0.0f, NULL, sx, sy);
         }
         C3D_FrameEnd(0);
         s_in_frame = 0;

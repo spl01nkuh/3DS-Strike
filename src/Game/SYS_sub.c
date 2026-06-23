@@ -553,6 +553,11 @@ void Game_Data_Init() {
 }
 
 void Setup_IO_ConvDataDefault(s32 id) {
+    /* Shot[ix] indexes Convert_Data: 0=LK 1=MK 2=HK 3=LP 4=MP 5=HP 9=3K 10=3P
+     * 11=none. Slot order = the 3DS button bound to it in ctr/pad.c:
+     *   0=A 1=B 2=R 3=ZL 4=X 5=Y 6=L 7=ZR.
+     * Desired default layout: X=MP Y=LP L=HP / A=MK B=LK R=HK / ZL,ZR = none
+     * (left for the user to assign). */
     const u8 ioConvInitData[12] = { 0, 1, 2, 11, 3, 4, 5, 11, 0, 0, 0, 0 };
     s32 ix;
 

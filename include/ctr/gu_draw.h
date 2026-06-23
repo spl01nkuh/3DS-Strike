@@ -33,6 +33,10 @@ void ctrGuDrawRectSolid(float x, float y, float w, float h, uint32_t color);
  * margin in screen px; 0 = no crop). Call while the top scene is active. */
 void ctrGuDrawCropBars(float off_x, float off_y);
 
+/* draw a lettered button glyph (light disc + dark label) in a screen-space
+ * rect — replaces the PlayStation button sprites with Nintendo controls. */
+void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label);
+
 #ifdef __cplusplus
 }
 #endif
