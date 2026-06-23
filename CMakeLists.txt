@@ -134,7 +134,7 @@ endif()
 # cmd<charID>.t3x. Add a character by appending "<id>|<filename>" to CMD_LIST.
 set(CMD_DIR "C:/Users/temz1/OneDrive/Documents/sf3 photoshop/finished bottom screen")
 set(CMD_LIST
-    "1|alexbottom screen.png"
+    "1|alex bottom screen.png"
     "14|akuma bottom screen.png"
     "16|makoto bottom screen.png"
     "15|chunli bottom screen.png"
