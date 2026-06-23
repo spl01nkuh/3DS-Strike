@@ -147,7 +147,13 @@ set(CMD_LIST
     "9|oro bottom screen.png"
     "11|ken bottom screen.png"
     "17|q bottom screen.png"
-    "19|remy bottom screen.png")
+    "19|remy bottom screen.png"
+    "0|gill bottom screen.png"
+    "18|twelve bottom screen.png"
+    "3|yun bottom screen.jpg"
+    "10|yang bottom screen.jpg"
+    "12|sean bottom screen.jpg"
+    "13|urien bottom screen.jpg")
 set(CMD_T3X_OUTPUTS "")
 foreach(entry ${CMD_LIST})
     string(REPLACE "|" ";" parts "${entry}")
