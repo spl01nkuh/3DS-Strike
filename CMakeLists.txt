@@ -140,7 +140,14 @@ set(CMD_LIST
     "15|chunli bottom screen.png"
     "4|dudley bottom screen.png"
     "8|elena bottom screen.png"
-    "6|hugo bottom screen.png")
+    "6|hugo bottom screen.png"
+    "2|ryu bottom screen.png"
+    "5|necro bottom screen.png"
+    "7|ibuki bottom screen.png"
+    "9|oro bottom screen.png"
+    "11|ken bottom screen.png"
+    "17|q bottom screen.png"
+    "19|remy bottom screen.png")
 set(CMD_T3X_OUTPUTS "")
 foreach(entry ${CMD_LIST})
     string(REPLACE "|" ";" parts "${entry}")
