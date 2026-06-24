@@ -265,6 +265,9 @@ void endFrame() {
             if (G_No[1] == 1) {
                 s8 cy = Cursor_Y[0], cx = Cursor_X[0];
                 c = (cy >= 0 && cy < 3 && cx >= 0 && cx < 8) ? ID_of_Face[cy][cx] : -1;
+                /* Gill (id 0) is not on the select grid; a transient 0 here is an
+                 * empty/uninitialized cell that briefly flashed Gill's image. */
+                if (c == 0) c = -1;
             } else {
                 c = (s16)My_char[0];
             }
