@@ -2272,7 +2272,7 @@ const u8 scrnAddTex1UV[9][4] = { { 96, 0, 32, 32 },  { 63, 0, 32, 32 },  { 0, 96
  * NULL keeps the original art (the big controller diagram at ix 8). */
 extern void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label);
 static const char *sf3_btn_label(s32 ix) {
-    static const char *const tbl[8] = { "A", "B", "R", "ZL", "X", "Y", "L", "ZR" };
+    static const char *const tbl[8] = { "A", "B", "L", "ZR", "X", "Y", "R", "ZL" };
     return (ix >= 0 && ix < 8) ? tbl[ix] : NULL;
 }
 

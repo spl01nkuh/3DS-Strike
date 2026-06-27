@@ -1870,10 +1870,10 @@ void Button_Config_Sub(s16 PL_id) {
 
 /* BUTTON CONFIG visual row order. The game stores the 8 buttons in slot order
  * (A,B,R,ZL,X,Y,L,ZR); this table maps each on-screen row (top to bottom) to its
- * underlying slot so the menu reads A,B,R,L,X,Y,ZR,ZL. Used here (editing) and in
+ * underlying slot so the menu reads A,B,R,L,X,Y,ZL,ZR. Used here (editing) and in
  * EFF10.c (drawing the glyph + function name). Rows 8/9/10 = vibration/default/
  * exit are not buttons and bypass this table. */
-const u8 Button_Cfg_Order[8] = { 0, 1, 2, 6, 4, 5, 7, 3 };
+const u8 Button_Cfg_Order[8] = { 0, 1, 2, 6, 4, 5, 3, 7 };
 
 void Button_Move_Sub_LR(u16 sw, s16 cursor_id) {
     s16 max;

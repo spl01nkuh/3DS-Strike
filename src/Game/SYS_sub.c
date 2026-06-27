@@ -553,12 +553,15 @@ void Game_Data_Init() {
 }
 
 void Setup_IO_ConvDataDefault(s32 id) {
-    /* Shot[ix] indexes Convert_Data: 0=LK 1=MK 2=HK 3=LP 4=MP 5=HP 9=3K 10=3P
-     * 11=none. Slot order = the 3DS button bound to it in ctr/pad.c:
+    /* Shot[ix] indexes Convert_Data: 0=LP 1=MP 2=HP 3=LK 4=MK 5=HK 9=3P 10=3K
+     * 11=none (verified from the in-game BUTTON CONFIG name strings). Slot order
+     * = the 3DS button bound to it in ctr/pad.c:
      *   0=A 1=B 2=R 3=ZL 4=X 5=Y 6=L 7=ZR.
-     * Desired default layout: X=MP Y=LP L=HP / A=MK B=LK R=HK / ZL,ZR = none
-     * (left for the user to assign). */
-    const u8 ioConvInitData[12] = { 0, 1, 2, 11, 3, 4, 5, 11, 0, 0, 0, 0 };
+     * With the swapped L/R glyphs (sc_sub.c) BUTTON CONFIG reads
+     * A=LK B=MK R=HK L=HP X=LP Y=MP, ZL/ZR=none:
+     *   A(0)=LK=3  B(1)=MK=4  R(2)=HP=2  ZL(3)=none=11
+     *   X(4)=LP=0  Y(5)=MP=1  L(6)=HK=5  ZR(7)=none=11 */
+    const u8 ioConvInitData[12] = { 3, 4, 2, 11, 0, 1, 5, 11, 0, 0, 0, 0 };
     s32 ix;
 
     for (ix = 0; ix < 12; ix++) {
@@ -675,7 +678,11 @@ void Copy_Check_w() {
 }
 
 const struct _SAVE_W Game_Default_Data = {
-    { { { 0, 1, 2, 11, 3, 4, 5, 11 }, 0, { 0, 0, 0 } }, { { 0, 1, 2, 11, 3, 4, 5, 11 }, 0, { 0, 0, 0 } } },
+    /* Pad_Infor[2]: per-slot Shot defaults (slot order A,B,R,ZL,X,Y,L,ZR). With the
+     * swapped L/R glyphs (sc_sub.c sf3_btn_label), BUTTON CONFIG reads as
+     * A=LK B=MK R=HK L=HP X=LP Y=MP, ZL/ZR=none. Boot default copied into every mode;
+     * keep in sync with ioConvInitData (DEFAULT SETTING). */
+    { { { 3, 4, 2, 11, 0, 1, 5, 11 }, 0, { 0, 0, 0 } }, { { 3, 4, 2, 11, 0, 1, 5, 11 }, 0, { 0, 0, 0 } } },
     2,
     99,
     { 1, 1 },
