@@ -2272,7 +2272,9 @@ const u8 scrnAddTex1UV[9][4] = { { 96, 0, 32, 32 },  { 63, 0, 32, 32 },  { 0, 96
  * NULL keeps the original art (the big controller diagram at ix 8). */
 extern void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label);
 static const char *sf3_btn_label(s32 ix) {
-    static const char *const tbl[8] = { "A", "B", "L", "ZR", "X", "Y", "R", "ZL" };
+    /* Glyph per slot, matching the physical 3DS button (ctr/pad.c slot order
+     * A,B,R,ZL,X,Y,L,ZR). No swap — label = physical button = binding. */
+    static const char *const tbl[8] = { "A", "B", "R", "ZL", "X", "Y", "L", "ZR" };
     return (ix >= 0 && ix < 8) ? tbl[ix] : NULL;
 }
 

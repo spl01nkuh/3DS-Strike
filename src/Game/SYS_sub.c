@@ -59,7 +59,17 @@ void Setup_Candidate_Buff(s16 PL_id);
 s16 Check_EM_Buff(s16 ix, s16 ok_urien);
 s32 Check_EM_Sub(s16 ix, s16 ok_urien, s16 Rnd);
 
-const u16 Convert_Data[12] = { 16, 32, 64, 256, 512, 1024, 272, 544, 1088, 112, 1792, 0 };
+/* Shot value (Convert_Data index) -> engine attack bitmask. IMPORTANT: the
+ * engine groups KICKS on the low bits and PUNCHES on the high bits:
+ *   LK=0x10  MK=0x20  HK=0x40   |   LP=0x100  MP=0x200  HP=0x400
+ * (verified in-match; the combos confirm it: 0x70 = 3 kicks, 0x700 = 3 punches).
+ * The name table (Letter_Data / button_string_data) is ordered
+ *   0=LP 1=MP 2=HP 3=LK 4=MK 5=HK
+ * so each index must emit the bit matching its NAME: punch group (0x100/0x200/
+ * 0x400) at idx 0-2, kick group (0x10/0x20/0x40) at idx 3-5. The original table
+ * had the two groups reversed, so every button did the opposite punch/kick
+ * in-match even though BUTTON CONFIG displayed the right name. */
+const u16 Convert_Data[12] = { 256, 512, 1024, 16, 32, 64, 272, 544, 1088, 112, 1792, 0 };
 
 void Switch_Screen_Init(s32 /* unused */) {
     WipeInit();
@@ -557,11 +567,11 @@ void Setup_IO_ConvDataDefault(s32 id) {
      * 11=none (verified from the in-game BUTTON CONFIG name strings). Slot order
      * = the 3DS button bound to it in ctr/pad.c:
      *   0=A 1=B 2=R 3=ZL 4=X 5=Y 6=L 7=ZR.
-     * With the swapped L/R + ZL/ZR glyphs (sc_sub.c) BUTTON CONFIG reads
-     * Y=LP X=MP L=HP R=HK B=LK A=MK, ZR/ZL=none:
-     *   A(0)=MK=4  B(1)=LK=3  R(2)=HP=2  ZL(3)=none=11
-     *   X(4)=MP=1  Y(5)=LP=0  L(6)=HK=5  ZR(7)=none=11 */
-    const u8 ioConvInitData[12] = { 4, 3, 2, 11, 1, 0, 5, 11, 0, 0, 0, 0 };
+     * Clean mapping (no glyph swap): each physical button does exactly its function.
+     * BUTTON CONFIG reads Y=LP X=MP L=HP R=HK B=LK A=MK, ZL/ZR=none:
+     *   A(0)=MK=4  B(1)=LK=3  R(2)=HK=5  ZL(3)=none=11
+     *   X(4)=MP=1  Y(5)=LP=0  L(6)=HP=2  ZR(7)=none=11 */
+    const u8 ioConvInitData[12] = { 4, 3, 5, 11, 1, 0, 2, 11, 0, 0, 0, 0 };
     s32 ix;
 
     for (ix = 0; ix < 12; ix++) {
@@ -678,11 +688,11 @@ void Copy_Check_w() {
 }
 
 const struct _SAVE_W Game_Default_Data = {
-    /* Pad_Infor[2]: per-slot Shot defaults (slot order A,B,R,ZL,X,Y,L,ZR). With the
-     * swapped L/R + ZL/ZR glyphs (sc_sub.c sf3_btn_label), BUTTON CONFIG reads as
-     * Y=LP X=MP L=HP R=HK B=LK A=MK, ZR/ZL=none. Boot default copied into every mode;
-     * keep in sync with ioConvInitData (DEFAULT SETTING). */
-    { { { 4, 3, 2, 11, 1, 0, 5, 11 }, 0, { 0, 0, 0 } }, { { 4, 3, 2, 11, 1, 0, 5, 11 }, 0, { 0, 0, 0 } } },
+    /* Pad_Infor[2]: per-slot Shot defaults (slot order A,B,R,ZL,X,Y,L,ZR). Clean
+     * mapping (no glyph swap): each physical button does exactly its function —
+     * Y=LP X=MP L=HP R=HK B=LK A=MK, ZL/ZR=none. Boot default copied into every
+     * mode; keep in sync with ioConvInitData (DEFAULT SETTING). */
+    { { { 4, 3, 5, 11, 1, 0, 2, 11 }, 0, { 0, 0, 0 } }, { { 4, 3, 5, 11, 1, 0, 2, 11 }, 0, { 0, 0, 0 } } },
     2,
     99,
     { 1, 1 },
