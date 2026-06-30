@@ -600,10 +600,19 @@ void palUpdateGhostCP3(s32 pal, s32 nums) {
     u16* dstAdrs;
 
     for (i = pal; i < (pal + nums); i++) {
+        /* Each CP3 ghost handle is a 256-color buffer, but ColorRAM is 64-color
+         * rows. On PSP the rows are contiguous in CLUT VRAM, so a 256-color
+         * texture at palette P reads rows P..P+3. The 3DS stores each handle
+         * separately, so we must pack all 4 contiguous ColorRAM rows into the
+         * handle here (was only 0x40 = 1 row -> indices >=64 rendered black:
+         * the opening/super "blob"). ColorRAM is contiguous so &ColorRAM[i]
+         * spans the next rows; clamp at the array end. */
+        s32 cnt = 0x100; /* 256 colors = 4 rows */
+        if (i + 4 > MAX_PALETTES) cnt = (MAX_PALETTES - i) * 0x40;
         flLockPalette(NULL, col3rd_w.palCP3.handle[i], &bits, 2);
         dstAdrs = bits.ptr;
         srcAdrs = (u16*)&ColorRAM[i];
-        palConvRowTim2CI8Clut(srcAdrs, dstAdrs, 0x40);
+        palConvRowTim2CI8Clut(srcAdrs, dstAdrs, cnt);
         flUnlockPalette(col3rd_w.palCP3.handle[i]);
     }
 }
