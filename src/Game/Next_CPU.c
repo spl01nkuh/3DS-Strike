@@ -1254,9 +1254,15 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
         return;
     }
 
+    /* Case values are raw SWK button bits (pad.c: LP=0x100 MP=0x200 HP=0x400
+     * LK=0x010 MK=0x020 HK=0x040). This switch used to have punch and kick
+     * bits crossed (e.g. "case 16" (LK) driving the color LP should have
+     * produced) — every color came out one button-strength off from what
+     * the player pressed. Case labels below are attached to the button they
+     * name; do not swap without re-deriving from pad.c's bit layout. */
     if (sw_new & 0x4000) {
         switch (sw) {
-        case 16:
+        case 256: /* LP */
             if (Player_Color[PL_id ^ 1] == 7 && id_0 == id_1) {
                 Player_Color[PL_id] = 10;
                 break;
@@ -1265,7 +1271,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 7;
             break;
 
-        case 32:
+        case 512: /* MP */
             if (Player_Color[PL_id ^ 1] == 8 && id_0 == id_1) {
                 Player_Color[PL_id] = 11;
                 break;
@@ -1274,7 +1280,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 8;
             break;
 
-        case 64:
+        default: /* HP */
             if (Player_Color[PL_id ^ 1] == 9 && id_0 == id_1) {
                 Player_Color[PL_id] = 12;
                 break;
@@ -1283,7 +1289,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 9;
             break;
 
-        case 256:
+        case 16: /* LK */
             if (Player_Color[PL_id ^ 1] == 10 && id_0 == id_1) {
                 Player_Color[PL_id] = 7;
                 break;
@@ -1292,7 +1298,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 10;
             break;
 
-        case 512:
+        case 32: /* MK */
             if (Player_Color[PL_id ^ 1] == 11 && id_0 == id_1) {
                 Player_Color[PL_id] = 8;
                 break;
@@ -1301,7 +1307,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 11;
             break;
 
-        default:
+        case 64: /* HK */
             if (Player_Color[PL_id ^ 1] == 12 && id_0 == id_1) {
                 Player_Color[PL_id] = 9;
                 break;
@@ -1312,7 +1318,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
         }
     } else {
         switch (sw) {
-        case 592:
+        case 1312: /* LP+MK+HP (0x100|0x020|0x400) */
             if (Player_Color[PL_id ^ 1] == 6 && id_0 == id_1) {
                 Player_Color[PL_id] = 0;
                 break;
@@ -1321,7 +1327,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 6;
             break;
 
-        case 16:
+        case 256: /* LP */
             if (Player_Color[PL_id ^ 1] == 0 && id_0 == id_1) {
                 Player_Color[PL_id] = 3;
                 break;
@@ -1330,7 +1336,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 0;
             break;
 
-        case 32:
+        case 512: /* MP */
             if (Player_Color[PL_id ^ 1] == 1 && id_0 == id_1) {
                 Player_Color[PL_id] = 4;
                 break;
@@ -1339,7 +1345,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 1;
             break;
 
-        case 64:
+        default: /* HP */
             if (Player_Color[PL_id ^ 1] == 2 && id_0 == id_1) {
                 Player_Color[PL_id] = 5;
                 break;
@@ -1348,7 +1354,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 2;
             break;
 
-        case 256:
+        case 16: /* LK */
             if (Player_Color[PL_id ^ 1] == 3 && id_0 == id_1) {
                 Player_Color[PL_id] = 0;
                 break;
@@ -1357,7 +1363,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 3;
             break;
 
-        case 512:
+        case 32: /* MK */
             if (Player_Color[PL_id ^ 1] == 4 && id_0 == id_1) {
                 Player_Color[PL_id] = 1;
                 break;
@@ -1366,7 +1372,7 @@ void Setup_PL_Color(s16 PL_id, u16 sw) {
             Player_Color[PL_id] = 4;
             break;
 
-        default:
+        case 64: /* HK */
             if (Player_Color[PL_id ^ 1] == 5 && id_0 == id_1) {
                 Player_Color[PL_id] = 2;
                 break;

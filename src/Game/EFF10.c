@@ -34,8 +34,8 @@ const s8* button_string_data[8][12] = {
       "L.P+L.K",
       "M.P+M.K",
       "H.P+H.K",
-      "PUNCH*3",
-      "KICK*3",
+      "KICK*3",  /* Convert_Data[9]  = LK|MK|HK */
+      "PUNCH*3", /* Convert_Data[10] = LP|MP|HP */
       "NONE" },
     { "VIBRATION OFF", "VIBRATION ON", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
     { "DEFAULT SETTING", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
