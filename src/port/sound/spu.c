@@ -313,6 +313,20 @@ void SPU_VoiceStop(int vnum) {
     active_voices &= ~(1ULL << vnum);
 }
 
+/* Unconditional "all voices off" for scene transitions (quit/pause/reset).
+ * emlShimSeStopAll() only stops voices it still has in its own tracking
+ * list; a voice whose envelope reaches 0 outside ADSR_PHASE_RELEASE (e.g.
+ * mid-decay/sustain) gets reclaimed by emlShim's gcVoices() without its
+ * active_voices bit ever being cleared here (that only happens when the
+ * phase advances past RELEASE). The stuck voice keeps occupying one of the
+ * MAX_ACTIVE_VOICES budget slots and can ramp back up from stale ADSR state,
+ * which is what produced degraded/hissing audio after quitting/re-entering
+ * a match. Clear everything directly so "stop all sound" actually does. */
+void SPU_StopAll(void) {
+    memset(voices, 0, sizeof(voices));
+    active_voices = 0;
+}
+
 void SPU_VoiceGetConf(int vnum, struct SPUVConf* conf) {
     SPU_Voice* v = &voices[vnum];
     conf->pitch = v->pitch;

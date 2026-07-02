@@ -27,5 +27,6 @@ void SPU_VoiceSetConf(int vnum, struct SPUVConf* conf);
 bool SPU_VoiceIsFinished(int vnum);
 void SPU_VoiceKeyOff(int vnum);
 void SPU_VoiceStop(int vnum);
+void SPU_StopAll(void);
 
 #endif // SPU_H_

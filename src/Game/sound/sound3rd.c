@@ -22,6 +22,7 @@
 // Sound port specific shims
 #include "psp/adx.h"
 #include "port/sound/emlShim.h"
+#include "port/sound/spu.h"
 
 // Main CPS3 types
 #include "structs.h"
@@ -261,6 +262,7 @@ void spu_all_off() {
     if (system_init_level & 1) {
         mlTsbStopAll();
         emlShimSeStopAll();
+        SPU_StopAll(); /* unconditional — see SPU_StopAll's comment */
     }
 }
 

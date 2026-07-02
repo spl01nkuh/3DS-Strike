@@ -710,9 +710,9 @@ const struct _SAVE_W Game_Default_Data = {
     0,
     15,
     15,
-    0,
-    { { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
-      { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } },
+    1, /* Extra_Option: enabled by default (normally earned by an extra-setting-free arcade clear) */
+    { { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 },
+      { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 } }, /* PL_Color: all alt colors unlocked by default (100% completion) */
     { { { 1, 3, 3, 0, 0, 1, 0, 0 },
         { 0, 0, 2, 2, 8, 8, 2, 0 },
         { 2, 2, 2, 2, 0, 0, 0, 0 },
