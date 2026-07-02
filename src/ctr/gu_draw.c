@@ -517,16 +517,13 @@ static int reconvert_entry(TexCacheEntry *e, int full) {
         /* Rebuild the index->RGBA LUT only when the palette changed since we last
          * built it for this entry — animated sheets reconvert every frame with an
          * unchanged palette, so this skips ~256 conversions per reconvert. CPS3
-         * colorkey: on real CPS3/PS2-derived data, color values carry no
-         * meaningful alpha at all — transparency is purely a function of INDEX.
-         * Index 0 must be forced fully transparent unconditionally (not "keep
-         * palette alpha" — the source alpha bit at slot 0 isn't reliable and
-         * can be set, which rendered opaque black/colored tiles wherever a
-         * sprite's background used index 0: the opening slogan/flag holes).
-         * All other indices are forced opaque so the alpha test doesn't tear
-         * glyphs/sprites. */
+         * colorkey: index 0 transparent (keep palette alpha), all others forced
+         * opaque so the alpha test doesn't tear glyphs/sprites. (Tried forcing
+         * index 0 to hard transparent regardless of source alpha as a fix for
+         * the opening-montage tile corruption — didn't fix it and caused a
+         * broader color regression, reverted.) */
         if (e->lut_clut != pal || e->lut_sum != e->clut_sum) {
-            e->lut[0] = 0;
+            e->lut[0] = conv5551(pal[0]);
             for (int i = 1; i < pal_count; i++)
                 e->lut[i] = conv5551(pal[i]) | 1u;
             e->lut_clut = pal;

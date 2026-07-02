@@ -2273,10 +2273,12 @@ const u8 scrnAddTex1UV[9][4] = { { 96, 0, 32, 32 },  { 63, 0, 32, 32 },  { 0, 96
 extern void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label);
 static const char *sf3_btn_label(s32 ix) {
     /* Glyph per slot, matching the physical 3DS button (ctr/pad.c slot order
-     * A,B,R,ZL,X,Y,L,ZR). ZL/ZR swapped per user request (slot 3 shows "ZR",
-     * slot 7 shows "ZL") — both are unbound (SWK none), so this only affects
-     * the displayed label, not any binding. */
-    static const char *const tbl[8] = { "A", "B", "R", "ZR", "X", "Y", "L", "ZL" };
+     * A,B,R,ZL,X,Y,L,ZR). ZL/ZR are fully remappable (BUTTON CONFIG), so the
+     * label at each slot MUST match what actually gets bound there — do not
+     * swap these two independently of the binding, or setting an option on
+     * the row labeled "ZL" silently binds physical ZR instead (and vice
+     * versa), which is exactly the wrong-button-fires bug this caused. */
+    static const char *const tbl[8] = { "A", "B", "R", "ZL", "X", "Y", "L", "ZR" };
     return (ix >= 0 && ix < 8) ? tbl[ix] : NULL;
 }
 

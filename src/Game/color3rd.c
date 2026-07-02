@@ -619,17 +619,14 @@ void palUpdateGhostCP3(s32 pal, s32 nums) {
 
 void palConvRowTim2CI8Clut(u16* src, u16* dst, s32 size) {
     s32 i;
-    /* PS2 GS CSM1 256-color CLUT storage swizzle: within each 32-entry block the
-     * middle two 8-entry groups are swapped ([8..15] <-> [16..23]). PS2/PSP
-     * hardware unswizzles the CLUT on upload; our software palette path must do
-     * it here, or every pixel whose index lands in those groups reads the wrong
-     * color — which rendered as black tile-shaped holes in opening slogans and
-     * some flags (bug #2). Was previously an identity copy (no swizzle). */
-    static const u8 clut_tbl[32] = { 0, 1, 2,  3,  4,  5,  6,  7,  16, 17, 18, 19, 20, 21, 22, 23,
-                                     8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31 };
-
+    /* Tried enabling the PS2 GS CSM1 256-color CLUT storage swizzle here
+     * (swap [8..15]<->[16..23] within each 32-entry block) as a hypothesis
+     * for the opening-montage tile corruption. It did not fix that bug and
+     * caused a broader color-rendering regression elsewhere, so it's back to
+     * an identity copy. Do not re-enable without isolated, full-game visual
+     * verification (not just the opening montage). */
     for (i = 0; i < size; i++) {
-        dst[(i & 0xE0) + clut_tbl[i & 0x1F]] = src[i];
+        dst[(i & 0xE0) + (i & 0x1F)] = src[i];
     }
 }
 
