@@ -16,6 +16,9 @@ Claude was used to port the game to the 3DS. This is an experiment to see how fa
 
 # SPECIAL THANKS
 The entire 3SX community
+
 Giblet (for letting me use their 3DS renderer)
+
 Demis98 (this is based off of their PSP port)
+
 My credit card (paid for Claude Pro)
