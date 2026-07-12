@@ -1,5 +1,6 @@
 #include "Game/DC_Ghost.h"
 #include "common.h"
+#include "ctr/ctr_game_renderer.h"
 //#include "sf33rd/AcrSDK/ps2/flps2render.h"
 //#include "sf33rd/AcrSDK/ps2/foundaps2.h"
 #include "psp/PPGFile.h"
@@ -165,76 +166,20 @@ void njdp2d_init() {
 
 
 void njdp2d_draw_0() {
-    ColorVertex *vertices, *vertices_total;
-    s32 i, j, k, w = 0;
-
-    for (i = njdp2d_w.ix1st; i != -1; i = njdp2d_w.prim[i].next) {
-        if(njdp2d_w.prim[i].type == 0)
-            w += 6;
-    }
-
-    if(DEMMA_DEBUG || skip_frame){
-        njdp2d_init();
-        return;
-    }
-    vertices_total = (ColorVertex*) sceGuGetMemory(w * sizeof(ColorVertex));
-    if(vertices_total == NULL){
-        njdp2d_init();
-        return;
-    }
-
-    w = 0;
-
-    sceGuDisable(GU_TEXTURE_2D);
+    Quad prm;
+    s32 i;
+    s32 j;
 
     for (i = njdp2d_w.ix1st; i != -1; i = njdp2d_w.prim[i].next) {
         if (njdp2d_w.prim[i].type == 0) {
-            vertices = &vertices_total[w];
-
-            for(j = 0; j < 3; j++){
-                k = -j + 5;
-                vertices[k].x = vertices[j].x = SCALE_X(njdp2d_w.prim[i].v[j].x);
-                vertices[k].y = vertices[j].y = SCALE_Y(njdp2d_w.prim[i].v[j].y);
-                /*__asm__ volatile (
-                    "mtv %2, S000\n"    // load njdp2d_w.prim[i].v[j].x to matrix
-                    "mtv %3, S001\n"    // load njdp2d_w.prim[i].v[j].y to matrix
-
-                    "vmul.p C000, C000, C410\n" // multiply matrix (scale)
-                    "vadd.p C000, C000, C420\n" // add matrix (offset)
-
-                    "mfv %0, S000\n"    // store in vertices[j].x
-                    "mfv %1, S001\n"    // store in vertices[j].y
-                    : "=r"(vertices[j].x), "=r"(vertices[j].y)  // %0 = vertices[j].x, %1 = vertices[j].y;
-                    : "r"(njdp2d_w.prim[i].v[j].x), "r"(njdp2d_w.prim[i].v[j].y)    // %2 = njdp2d_w.prim[i].v[j].x, %3 = njdp2d_w.prim[i].v[j].y;
-                );*/
-                vertices[k].x = vertices[j].x;
-                vertices[k].y = vertices[j].y;
-                vertices[k].z = vertices[j].z = njdp2d_w.prim[i].v[j].z;
-                vertices[k].colour = vertices[j].colour = fixARGB(njdp2d_w.prim[i].col);
+            for (j = 0; j < 4; j++) {
+                prm.v[j] = njdp2d_w.prim[i].v[j];
             }
-            vertices[5].x = SCALE_X(njdp2d_w.prim[i].v[j].x);
-            vertices[5].y = SCALE_Y(njdp2d_w.prim[i].v[j].y);
-            /*__asm__ volatile (
-                "mtv %2, S000\n"    // load njdp2d_w.prim[i].v[j].x to matrix
-                "mtv %3, S001\n"    // load njdp2d_w.prim[i].v[j].y to matrix
 
-                "vmul.p C000, C000, C410\n" // multiply matrix (scale)
-                "vadd.p C000, C000, C420\n" // add matrix (offset)
-
-                "mfv %0, S000\n"    // store in vertices[j].x
-                "mfv %1, S001\n"    // store in vertices[j].y
-                : "=r"(vertices[5].x), "=r"(vertices[5].y)  // %0 = vertices[5].x, %1 = vertices[5].y;
-                : "r"(njdp2d_w.prim[i].v[j].x), "r"(njdp2d_w.prim[i].v[j].y)    // %2 = njdp2d_w.prim[i].v[j].x, %3 = njdp2d_w.prim[i].v[j].y;
-            );*/
-            
-            vertices[5].z = njdp2d_w.prim[i].v[j].z;
-            vertices[5].colour = vertices[j].colour;
-            w += 6;
+            SDLGameRenderer_DrawSolidQuad(&prm, njdp2d_w.prim[i].col);
         }
     }
-    if(!DEMMA_DEBUG && !skip_frame)
-        sceGuDrawArray(GU_TRIANGLES, GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, w, 0, vertices_total);
-    sceGuEnable(GU_TEXTURE_2D);
+
     njdp2d_init();
 }
 

@@ -1,0 +1,34 @@
+; Minimal 2D textured vertex shader for 3DS
+; Transforms 2D positions by orthographic projection,
+; passes through texcoords and vertex colors.
+
+.fvec projection[4]
+
+.constf myconst(0.0, 1.0, 0.00392156862745, 0.0)
+.alias  ones   myconst.yyyy
+
+.out oPosition  position
+.out oTexCoord0 texcoord0
+.out oColor     color
+
+.in iPosition  v0    ; x, y, z (float)
+.in iTexCoord  v1    ; u, v (float)
+.in iColor     v2    ; r, g, b, a (float, 0.0-1.0)
+
+.entry main
+.proc main
+    ; Transform position by projection matrix
+    mov r0.xyz, iPosition
+    mov r0.w,   ones
+
+    dp4 oPosition.x, projection[0], r0
+    dp4 oPosition.y, projection[1], r0
+    dp4 oPosition.z, projection[2], r0
+    dp4 oPosition.w, projection[3], r0
+
+    ; Pass through texcoord and color
+    mov oTexCoord0, iTexCoord
+    mov oColor, iColor
+
+    end
+.end

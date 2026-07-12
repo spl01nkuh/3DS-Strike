@@ -466,13 +466,29 @@ void cpLoopTask() {
     }
 #endif
 
+    /* PORT DIAG: TEMP. Per-task-slot timing to isolate which subsystem inside
+     * njUserMain's dispatcher dominates frame cost (game logic vs rendering
+     * already ruled out separately — RENDPROF's own build/sort/submit costs
+     * are consistently near-zero even during real Remy's-stage gameplay). */
+    extern void debug_print(const char *fmt, ...);
+    static u64 __diag_task_ticks[11];
+    static u64 __diag_task_calls[11];
+    static int __diag_frame_ctr;
+
     for (int i = 0; i < 11; i++) {
         struct _TASK* task_ptr = &task[i];
 
         switch (task_ptr->condition) {
-        case 1:
+        case 1: {
+            u64 __diag_t0 = svcGetSystemTick();
             task_ptr->func_adrs(task_ptr);
+            u64 __diag_t1 = svcGetSystemTick();
+            if (__diag_t1 > __diag_t0) {
+                __diag_task_ticks[i] += (__diag_t1 - __diag_t0);
+                __diag_task_calls[i]++;
+            }
             break;
+        }
 
         case 2:
             task_ptr->condition = 1;
@@ -480,6 +496,18 @@ void cpLoopTask() {
 
         case 3:
             break;
+        }
+    }
+
+    if (++__diag_frame_ctr >= 60) {
+        __diag_frame_ctr = 0;
+        for (int i = 0; i < 11; i++) {
+            double ms = (double)__diag_task_ticks[i] * 1000.0 / 268111856.0;
+            if (ms > 0.05) {
+                debug_print("TASKPROF t=%d ms=%.1f calls=%d", i, ms, (int)__diag_task_calls[i]);
+            }
+            __diag_task_ticks[i] = 0;
+            __diag_task_calls[i] = 0;
         }
     }
 }

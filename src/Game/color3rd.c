@@ -421,6 +421,13 @@ void init_trans_color_ram(s16 id, s16 key, u8 type, u16 data) {
     case 0xc:
     case 0x61:
         break;
+
+    /* 0x62/0x63: load-and-keep-resident types (e.g. the opening montage
+     * texture, later found via Search_ramcnt_type) — correctly no palette
+     * copy and no key push here. */
+    case 0x62:
+    case 0x63:
+        break;
     }
 }
 
@@ -587,10 +594,10 @@ void palUpdateGhostDC() {
             dstAdrs = bits.ptr;
             srcAdrs = &colPalBuffDC[i << 6];
             palConvRowTim2CI8Clut(srcAdrs, dstAdrs, 0x40);
-            flUnlockPalette(col3rd_w.palDC.handle[i]);            
+            flUnlockPalette(col3rd_w.palDC.handle[i]);
         }
     }
-    col3rd_w.upBits = 0;  
+    col3rd_w.upBits = 0;
 }
 
 void palUpdateGhostCP3(s32 pal, s32 nums) {
@@ -619,14 +626,22 @@ void palUpdateGhostCP3(s32 pal, s32 nums) {
 
 void palConvRowTim2CI8Clut(u16* src, u16* dst, s32 size) {
     s32 i;
-    /* Tried enabling the PS2 GS CSM1 256-color CLUT storage swizzle here
-     * (swap [8..15]<->[16..23] within each 32-entry block) as a hypothesis
-     * for the opening-montage tile corruption. It did not fix that bug and
-     * caused a broader color-rendering regression elsewhere, so it's back to
-     * an identity copy. Do not re-enable without isolated, full-game visual
-     * verification (not just the opening montage). */
+    /* PS2 GS CSM1 CLUT storage swizzle: within each 32-entry block, entries
+     * [8..15] and [16..23] swap positions. The native renderer's palette
+     * capture (SDLGameRenderer_CreatePalette) unswizzles with clut_shuf()
+     * when reading the buffer, so the write side here MUST store swizzled —
+     * otherwise every ghost-faded palette row (DC + CP3: opening overlays,
+     * white flashes, in-match palette fades) renders with colors 8-15 and
+     * 16-23 exchanged (coherent shapes in flat wrong colors, e.g. bright
+     * green). NOTE: an earlier attempt at this swizzle was correctly
+     * rejected — but that was under the OLD gu_draw.c renderer, which read
+     * palettes without clut_shuf(); with the native renderer the swizzle is
+     * required for the round trip to cancel out (matches reference tree). */
+    static u8 clut_tbl[32] = { 0, 1, 2,  3,  4,  5,  6,  7,  16, 17, 18, 19, 20, 21, 22, 23,
+                               8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31 };
+
     for (i = 0; i < size; i++) {
-        dst[(i & 0xE0) + (i & 0x1F)] = src[i];
+        dst[(i & 0xE0) + clut_tbl[i & 0x1F]] = src[i];
     }
 }
 

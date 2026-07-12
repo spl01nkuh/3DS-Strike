@@ -33,9 +33,13 @@ void ctrGuDrawRectSolid(float x, float y, float w, float h, uint32_t color);
  * margin in screen px; 0 = no crop). Call while the top scene is active. */
 void ctrGuDrawCropBars(float off_x, float off_y);
 
-/* draw a lettered button glyph (light disc + dark label) in a screen-space
- * rect — replaces the PlayStation button sprites with Nintendo controls. */
+/* draw the Nintendo Switch button-icon art in a screen-space rect — replaces
+ * the PlayStation button sprites. Called mid-frame; only queues the request
+ * (see ctrDrawButtonGlyph's comment) — call ctrGuFlushButtonGlyphs() later in
+ * the same frame, after the native renderer's main batch submits, to actually
+ * draw them. */
 void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label);
+void ctrGuFlushButtonGlyphs(void);
 
 #ifdef __cplusplus
 }

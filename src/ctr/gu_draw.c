@@ -8,6 +8,7 @@
  */
 #include <pspshim.h>
 #include "ctr/gu_draw.h"
+#include "ctr/ctr_game_renderer.h"
 
 #include <3ds.h>
 #include <citro2d.h>
@@ -652,6 +653,28 @@ static TexCacheEntry *use_entry(TexCacheEntry *e) {
     return e;
 }
 
+/* memo for the palette checksum in resolve_texture (file-scope so palette
+ * writes can invalidate it — see ctrGuClutWritten) */
+static const void *memo_clut;
+static uint32_t memo_sum;
+static uint16_t memo_fp0, memo_fp1, memo_fp2;
+
+/* Called by the shim (flUnlockPalette / flCreatePaletteHandle) whenever a
+ * palette buffer's CONTENT has just been written in place. The checksum memo
+ * fingerprints only 3 spread-out entries, which misses writes that leave
+ * those entries unchanged — e.g. the opening's color-trans fades rewrite
+ * entries 1..63 of a DC-ghost row while entry 0 is always transparent and
+ * entries 128/255 are never written. The stale sum then revalidates cache
+ * entries converted with the OLD palette: elements render frozen at their
+ * pre-fade colors (the attract "black box"/notch corruption). Killing the
+ * memo forces a fresh hash on next bind; the changed sum cascades into a
+ * palette-LUT rebuild and reconversion. Cost: one pointer compare per
+ * palette write (a handful per frame). */
+void ctrGuClutWritten(const void *buf) {
+    if (buf == NULL || buf == memo_clut)
+        memo_clut = NULL;
+}
+
 static TexCacheEntry *resolve_texture(void) {
     if (!s_gu.tex_ptr)
         return NULL;
@@ -663,10 +686,9 @@ static TexCacheEntry *resolve_texture(void) {
      * sprite matched an old (often not-yet-loaded, all-black) palette variant
      * already in the cache -> "black boxes throughout the game". Always hash the
      * live palette so a reloaded CLUT is detected immediately and gets its own
-     * cache entry. (Memoize only across consecutive identical pointers+contents.) */
-    static const void *memo_clut;
-    static uint32_t memo_sum;
-    static uint16_t memo_fp0, memo_fp1, memo_fp2;
+     * cache entry. (Memoize only across consecutive identical pointers+contents,
+     * and see ctrGuClutWritten: any in-place palette write kills the memo — the
+     * 3-entry fingerprint below cannot see writes that keep those entries equal.) */
     uint32_t sum;
     if (s_gu.format == GU_PSM_T4 || s_gu.format == GU_PSM_T8) {
         int pal_count = (s_gu.format == GU_PSM_T4) ? 16 : 256;
@@ -875,37 +897,72 @@ void ctrGuDrawCropBars(float off_x, float off_y) {
     }
 }
 
-/* Draw a simple lettered button glyph (light disc + dark label) filling the
- * given screen-space rect — replaces the PlayStation button sprites so prompts
- * read as Nintendo controls. label is a short string ("A","B","X","Y","L"...). */
+/* Real Nintendo Switch button-icon art (romfs:/buttons.t3x), packed in this
+ * fixed order by the BTN_LIST in CMakeLists.txt — index here MUST match. */
+static C2D_SpriteSheet s_btn_sheet;
+static C2D_Image s_btn_img[8];
+static int s_btn_ready;
+
+static int btn_label_index(const char *label) {
+    static const char *const tbl[8] = { "A", "B", "X", "Y", "L", "R", "ZL", "ZR" };
+    for (int i = 0; i < 8; i++)
+        if (strcmp(label, tbl[i]) == 0) return i;
+    return -1;
+}
+
+/* Pending glyph draws for this frame — see ctrDrawButtonGlyph for why these
+ * are queued instead of drawn immediately. */
+#define BTN_GLYPH_QUEUE_MAX 32
+typedef struct { float x0, y0, x1, y1; int idx; } BtnGlyphReq;
+static BtnGlyphReq s_btn_queue[BTN_GLYPH_QUEUE_MAX];
+static int s_btn_queue_count;
+
+/* Draw the Nintendo Switch button-icon art filling the given screen-space
+ * rect — replaces the PlayStation button sprites so prompts read as Nintendo
+ * controls. label is a short string ("A","B","X","Y","L","R","ZL","ZR"),
+ * matching the physical 3DS button each game slot is bound to (see
+ * sf3_btn_label in sc_sub.c).
+ *
+ * Called mid-frame from effect_23_move (game logic), interleaved with the
+ * rest of the menu's own sprite content — which is queued and only actually
+ * submitted later, in SDLGameRenderer_RenderFrame() (called from endFrame()).
+ * Drawing immediately here — via citro2d OR a raw C3D call — got silently
+ * painted over once that later, full-menu-content batch submitted, since it
+ * draws after us at the same pixels. So this only records the request; the
+ * actual draw happens in ctrGuFlushButtonGlyphs(), called from endFrame()
+ * after that submission, the same way crop bars and the bottom screen art
+ * already draw late to survive being interleaved with the native renderer. */
 void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label) {
     if (x1 < x0) { float t = x0; x0 = x1; x1 = t; }
     if (y1 < y0) { float t = y0; y0 = y1; y1 = t; }
-    float w = x1 - x0, h = y1 - y0;
-    float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
-    float r = (w < h ? w : h) * 0.5f * 0.80f; /* margin so the disc sits a bit smaller than its cell */
-    if (r < 3.0f) return;
-    const float z = 0.95f;
 
-    s_blend_mode = 0x32; /* standard alpha so the disc is opaque */
-    apply_blend();
+    if (!s_btn_ready) {
+        s_btn_sheet = C2D_SpriteSheetLoad("romfs:/buttons.t3x");
+        int n = s_btn_sheet ? C2D_SpriteSheetCount(s_btn_sheet) : 0;
+        for (int i = 0; i < 8 && i < n; i++)
+            s_btn_img[i] = C2D_SpriteSheetGetImage(s_btn_sheet, i);
+        s_btn_ready = 1;
+    }
 
-    /* thin white outline so the black disc stays visible on dark backgrounds,
-     * flat black face (no gradient), white letter — Nintendo button look */
-    C2D_DrawCircleSolid(cx, cy, z, r, C2D_Color32(0xFF, 0xFF, 0xFF, 0xFF));         /* outline */
-    C2D_DrawCircleSolid(cx, cy, z, r * 0.86f, C2D_Color32(0x00, 0x00, 0x00, 0xFF)); /* black face */
+    int idx = btn_label_index(label);
+    if (!s_btn_sheet || idx < 0) return;
+    if (s_btn_queue_count >= BTN_GLYPH_QUEUE_MAX) return;
 
-    static C2D_TextBuf gbuf;
-    if (!gbuf) gbuf = C2D_TextBufNew(32);
-    C2D_TextBufClear(gbuf);
-    C2D_Text txt;
-    C2D_TextParse(&txt, gbuf, label);
-    C2D_TextOptimize(&txt);
-    float scale = (2.0f * r) / 40.0f;
-    float tw = 0.0f, th = 0.0f;
-    C2D_TextGetDimensions(&txt, scale, scale, &tw, &th);
-    C2D_DrawText(&txt, C2D_WithColor, cx - tw * 0.5f, cy - th * 0.5f, z, scale, scale,
-                 C2D_Color32(0xFF, 0xFF, 0xFF, 0xFF));
+    BtnGlyphReq *req = &s_btn_queue[s_btn_queue_count++];
+    req->x0 = x0; req->y0 = y0; req->x1 = x1; req->y1 = y1; req->idx = idx;
+}
+
+/* Actually draw this frame's queued button glyphs — called from endFrame()
+ * after SDLGameRenderer_RenderFrame() has submitted the rest of the frame's
+ * sprite content, so our icons land on top instead of being painted over. */
+void ctrGuFlushButtonGlyphs(void) {
+    for (int i = 0; i < s_btn_queue_count; i++) {
+        BtnGlyphReq *req = &s_btn_queue[i];
+        Tex3DS_SubTexture *st = s_btn_img[req->idx].subtex;
+        SDLGameRenderer_DrawGlyphQuad(s_btn_img[req->idx].tex, req->x0, req->y0, req->x1, req->y1,
+                                      st->left, st->top, st->right, st->bottom);
+    }
+    s_btn_queue_count = 0;
 }
 
 /* --------------------------------------------- GU entry points (fl.c) -- */

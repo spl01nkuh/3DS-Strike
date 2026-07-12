@@ -62,7 +62,22 @@ SceUID sceIoOpen(const char *file, int flags, SceMode mode) {
 int sceIoClose(SceUID fd) { return (fd >= 0) ? close(fd) : -1; }
 
 int sceIoRead(SceUID fd, void *data, SceSize size) {
+    /* Spike probe: a blocking content read on the main thread is one of the
+     * three candidate causes of mid-fight animation stutter. Prints ONLY on
+     * a >=4ms call — silent in steady state. */
+    extern void debug_print(const char *fmt, ...);
+    /* Attribution: afs.c publishes which fd belongs to the main-thread sync
+     * path vs the background I/O thread, plus the fnum each is reading. A
+     * SYNC spike is a real frame stall; a bg spike is harmless overlap. */
+    extern volatile int g_afs_sync_fd, g_afs_async_fd, g_afs_sync_fnum, g_afs_io_fnum;
+    u64 t0 = svcGetSystemTick();
     int n = read(fd, data, size);
+    double ms = (double)(svcGetSystemTick() - t0) * 1000.0 / 268111856.0;
+    if (ms >= 4.0) {
+        const char* who = (fd == g_afs_sync_fd) ? "SYNC" : (fd == g_afs_async_fd) ? "bg" : "other";
+        debug_print("IOSPIKE %.1fms %d bytes %s sfn=%d afn=%d", ms, (int)size, who,
+                    g_afs_sync_fnum, g_afs_io_fnum);
+    }
     return (n < 0) ? -1 : n;
 }
 

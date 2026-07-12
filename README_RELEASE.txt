@@ -53,20 +53,38 @@ Then launch "SFIII 3rd Strike" from the Homebrew Launcher.
 ----------------------------------------------------------------
  NEW IN THIS BUILD
 ----------------------------------------------------------------
-- SAVING: settings, button config, options, rankings and unlock
-  progress now persist to your SD card and survive a reboot
-  (stored at /3ds/sf3/SETTINGS.BIN -- created automatically).
-- Nintendo button glyphs on all on-screen prompts.
-- ZL / ZR are fully remappable in BUTTON CONFIG.
-- Smoother pause-menu audio (the muffle is no longer harsh/lo-fi).
+- ALL-NEW RENDERER: the drawing backend was replaced with a native,
+  atlas-based GPU renderer. Fixes a long list of glitches from the old
+  backend (missing character-select / stage / score-screen backgrounds,
+  wrong logo colors, stage "holes") and draws far more efficiently.
+- PERFORMANCE: palette animations (charge glows, parry flashes, super
+  freezes) no longer force expensive texture rebuilds mid-fight; GPU
+  cache flushes are batched per frame; overflow textures now share
+  strip textures so they batch into far fewer draw calls (the attract
+  opening ran at 3-10x fewer draw calls in testing); and the GPU sprite
+  cache got 50% more headroom to cut mid-fight rebuild stutters.
+- Bottom-screen move-list art now loads on a background thread — moving
+  the character-select cursor no longer hitches the game while the next
+  character's art streams in.
+- BOTTOM SCREEN: per-character move-list art now works for the WHOLE
+  roster (previously only some characters showed; the rest silently fell
+  back to the default cover due to a memory limit).
+- Real Nintendo Switch button icon art on the pause prompt and BUTTON
+  CONFIG rows (replaces the plain lettered discs).
+- Pause prompt now correctly shows -- and responds to -- the A button.
+
+ Previously added, still included: SD-card saving (SETTINGS.BIN), fully
+ remappable ZL/ZR, smoother pause-menu audio.
 
 ----------------------------------------------------------------
  NOTES / KNOWN ISSUES
 ----------------------------------------------------------------
-- New 3DS runs best. Old 3DS is playable; very busy stages may dip below 60fps.
+- New 3DS runs best. Old 3DS is playable; the renderer got a major
+  performance pass this build, but the attract-mode opening montage (not
+  gameplay) can still dip below 60fps.
 - Sound requires dspfirm.cdc (see above).
-- One attract-screen opening effect (text dissolving into squares) still
-  shows minor artifacts. Gameplay and menus are unaffected.
+- One attract-screen opening effect (text dissolving into squares) may
+  still show minor artifacts. Gameplay and menus are unaffected.
 
 ----------------------------------------------------------------
  CREDITS

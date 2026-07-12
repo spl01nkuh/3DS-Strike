@@ -356,6 +356,13 @@ s32 effect_36_init(u8 typenum) {
     s16 ix;
     const s16* data_ptr;
 
+    /* (Removed) An old-renderer-era gate suppressed spawn types
+     * {0,3,5,8,10,13} (opening typewriter cursors) here because they rendered
+     * as opaque dark blocks — that was the ghost-palette CSM1-swizzle bug
+     * (color3rd.c palConvRowTim2CI8Clut), since fixed for the native
+     * renderer. These elements carry their intended palette content now, so
+     * they spawn again like on retail. */
+
     if (Debug_w[48] & 0x10) {
         return 0;
     }
@@ -365,6 +372,26 @@ s32 effect_36_init(u8 typenum) {
     }
 
     ewk = (WORK_Other*)frw[ix];
+
+    { /* effect_36_init historically left these control fields to whatever the
+       * RECYCLED pool slot's previous occupant wrote (state machine indices,
+       * fade level, flip/brightness) — identical code then behaves
+       * differently per platform purely through pool history. Initialize
+       * them explicitly so behavior is deterministic. */
+        s16 k;
+        for (k = 0; k < 8; k++) {
+            if (k != 1) ewk->wu.routine_no[k] = 0; /* [1] is set from the script table below */
+        }
+        ewk->wu.my_clear_level = 0;
+        ewk->wu.my_bright_type = 0;
+        ewk->wu.my_bright_level = 0;
+        ewk->wu.my_mr_flag = 0;
+        ewk->wu.my_roll_flag = 0;
+        ewk->wu.rl_flag = 0;
+        ewk->wu.cg_flip = 0;
+        ewk->wu.disp_flag = 0;
+    }
+
     data_ptr = eff36_data_tbl[typenum];
     ewk->wu.id = 0x24;
     ewk->wu.be_flag = 1;
@@ -386,6 +413,7 @@ s32 effect_36_init(u8 typenum) {
     ewk->wu.char_index = *data_ptr++;
     ewk->wu.old_rno[2] = *data_ptr++;
     ewk->wu.old_rno[1] = *data_ptr++;
+
     effect_36_move(ewk);
     return 0;
 }

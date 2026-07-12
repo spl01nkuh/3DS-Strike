@@ -244,6 +244,61 @@ void texture_cash_update() {
     s16 i;
     s16 num;
 
+    /* 3DS: budgeted background decode of registered charset groups so
+     * first-use of every move runs at full speed (see MTRANS.c). */
+    { extern void mlt_prewarm_tick(void); mlt_prewarm_tick(); }
+
+    /* 3DS LOADING WINDOWS (user plan): every scene transition (G_No change —
+     * covers boot→attract, →char select, →VS/fight, fight→score, all four
+     * planned points) arms a ~4s boosted-decode window and re-arms completed
+     * prewarm jobs so the incoming scene's groups re-verify. Decode then
+     * finishes inside the transition visuals instead of during play. */
+    {
+        extern u8 G_No[4];
+        extern void mlt_prewarm_boost(u32 frames);
+        extern void mlt_prewarm_restart(void);
+        static u8 pv_gno0 = 255, pv_gno1 = 255;
+        if (G_No[0] != pv_gno0 || G_No[1] != pv_gno1) {
+            pv_gno0 = G_No[0];
+            pv_gno1 = G_No[1];
+            mlt_prewarm_boost(240);
+            mlt_prewarm_restart();
+        }
+    }
+
+    /* PROBE (cheap, every ~2s): per-group ACTIVITY DELTAS — distinguishes,
+     * for a PARKED preview, whether a group keeps rebuilding pattern
+     * instances (bld>0: its CG loop cycles the 64-entry PatternCollection →
+     * constant rebuild + lookup-scan work) vs replaying cached instances
+     * (hit-only). Also slot-count growth (du16/du32 = new tiles melted). */
+    {
+        extern void debug_print(const char *fmt, ...);
+        extern u32 g_pat_build[24];
+        extern u32 g_pat_hit[24];
+        static u32 gs_frames = 0;
+        static u32 pv_build[24], pv_hit[24];
+        static s32 pv_u16[24], pv_u32[24];
+        if ((++gs_frames % 120) == 0) {
+            for (s16 gx = 0; gx < 24; gx++) {
+                if (!mts_ok[gx].be) continue;
+                if (!(mts[gx].ext && mts[gx].tpf && mts[gx].tpu)) continue;
+                u32 db = g_pat_build[gx] - pv_build[gx];
+                u32 dh = g_pat_hit[gx] - pv_hit[gx];
+                s32 du16 = mts[gx].tpu->x16 - pv_u16[gx];
+                s32 du32 = mts[gx].tpu->x32 - pv_u32[gx];
+                pv_build[gx] = g_pat_build[gx];
+                pv_hit[gx] = g_pat_hit[gx];
+                pv_u16[gx] = mts[gx].tpu->x16;
+                pv_u32[gx] = mts[gx].tpu->x32;
+                if (db == 0 && dh == 0 && du16 == 0 && du32 == 0) continue;
+                debug_print("GRPACT ix=%d bld=%u hit=%u du16=%d du32=%d f16=%d f32=%d kazu=%d",
+                            gx, db, dh, du16, du32,
+                            mts[gx].tpf->x16, mts[gx].tpf->x32,
+                            mts[gx].cpat ? mts[gx].cpat->kazu : -1);
+            }
+        }
+    }
+
     for (num = 0; num < 24; num++) {
         if (mts_ok[num].be != 0) {
             if (mts[num].ext) {
@@ -290,9 +345,13 @@ void update_with_tpu_free(PatternState* mc16, PatternState* mc32) {
             } while (1);
         }
 
-        if (mc16[tpu_free->x16_used[i]].time <= 0) {
-            mc16[tpu_free->x16_used[i]].cs.code = -1;
-        }
+        /* 3DS LAZY RELEASE: keep the slot's identity (cs.code) when its
+         * refcount hits zero instead of wiping it. The slot stays findable
+         * in the used list, so replaying the same move HITS the cache and
+         * skips the LZ decompress + GPU re-upload entirely (the measured
+         * mid-fight MELTSPIKE stutters were exactly these re-decodes).
+         * get_mltbuf16_ext_2 evicts a time<=0 slot when it actually needs
+         * space — decode-once semantics, same memory footprint. */
     }
 
     for (i = 0; i < tpu_free->x32; i++) {
@@ -306,9 +365,7 @@ void update_with_tpu_free(PatternState* mc16, PatternState* mc32) {
             } while (1);
         }
 
-        if (mc32[tpu_free->x32_used[i]].time <= 0) {
-            mc32[tpu_free->x32_used[i]].cs.code = -1;
-        }
+        /* 3DS LAZY RELEASE — see the x16 loop above. */
     }
 }
 
@@ -354,6 +411,10 @@ void make_texcash_work(s16 ix) {
             page16 = mts_base[ix].p16;
             page32 = mts_base[ix].p32;
         }
+
+        /* 3DS: group being (re)built — cancel/restart any prewarm jobs so
+         * they don't touch freshly-reset slot state with stale cursors */
+        { extern void mlt_prewarm_reset(void); mlt_prewarm_reset(); }
 
         mts[ix].mltnum16 = (u32)page16 << 8;
         mts[ix].mltnum32 = page32 << 6;
@@ -452,9 +513,16 @@ void clear_texcash_work(s16 ix) {
     }
 }
 
+/* per-mts purge counter consumed by the native renderer's profile output */
+u32 texcash_purge_counts[24] = { 0 };
+
 void purge_texcash_work(s16 ix) {
     if (mts_ok[ix].be == 0) {
         return;
+    }
+
+    if (ix >= 0 && ix < 24) {
+        texcash_purge_counts[ix]++;
     }
 
     if ((Test_ramcnt_key(mts_ok[ix].key0) != 0) && (Test_ramcnt_key(mts_ok[ix].key1) != 0)) {
@@ -480,8 +548,14 @@ const MTSBase mts_base[24] = {
     { .p16 = 0, .p32 = 0, .gix = 0, .life16 = 0, .life32 = 0, .type = 0, .mode = 0, .attribute = 0 },
     { .p16 = 1, .p32 = 1, .gix = 20, .life16 = 0, .life32 = 0, .type = 8, .mode = 4114, .attribute = 1 },
     { .p16 = 2, .p32 = 4, .gix = 30, .life16 = 8, .life32 = 8, .type = 8, .mode = 4113, .attribute = 1 },
-    { .p16 = 3, .p32 = 6, .gix = 40, .life16 = 20, .life32 = 20, .type = 9, .mode = 8209, .attribute = 1 },
-    { .p16 = 3, .p32 = 6, .gix = 50, .life16 = 20, .life32 = 20, .type = 9, .mode = 8209, .attribute = 1 },
+    /* 3DS: p32 6→7 (+64 32px slots each). The char-select super-art preview's
+     * 32px working set exceeded 384 slots (GRPSTAT: f32=0 pegged while melts
+     * continued) → re-decode churn every preview loop. Each group's 10-handle
+     * gix window (40-49 / 50-59) has exactly one spare page; struct bounds
+     * (x32_free/used[640], x32_map 640 bits) allow up to 10 pages. +192KB
+     * RAM per group. */
+    { .p16 = 3, .p32 = 7, .gix = 40, .life16 = 20, .life32 = 20, .type = 9, .mode = 8209, .attribute = 1 },
+    { .p16 = 3, .p32 = 7, .gix = 50, .life16 = 20, .life32 = 20, .type = 9, .mode = 8209, .attribute = 1 },
     { .p16 = 1, .p32 = 4, .gix = 60, .life16 = 2, .life32 = 2, .type = 9, .mode = 8210, .attribute = 1 },
     { .p16 = 1, .p32 = 5, .gix = 70, .life16 = 0, .life32 = 0, .type = 8, .mode = 4113, .attribute = 1 },
     { .p16 = 1, .p32 = 1, .gix = 80, .life16 = 12, .life32 = 12, .type = 9, .mode = 8210, .attribute = 1 },

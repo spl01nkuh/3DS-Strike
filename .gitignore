@@ -6,3 +6,6 @@ build_wsl/
 PSP/
 3s-psp.zip
 3s-psp-experimental.zip
+dist/
+*.newport
+build1.log

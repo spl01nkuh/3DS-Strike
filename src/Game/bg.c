@@ -1067,7 +1067,10 @@ void bgRWWorkUpdate() {
 void bgDrawOneScreen(s32 bgnum, s32 gixbase, s32* xx, s32* yy, s32 /* unused */, s32 ofsPal, PPGDataList* curDataList) {
     s32 i, x, y, gbix;
 
-    if(DEMMA_DEBUG || skip_frame)
+    /* (Removed) an old-renderer skip_frame gate here drew the backdrop only
+     * on non-skipped frames — under the native renderer that made backdrops
+     * strobe/flicker. The native path is cheap (atlas-cached); draw always. */
+    if (DEMMA_DEBUG)
         return;
 
     for (y = yy[0]; y < yy[1]; y += 128) {
@@ -1101,9 +1104,24 @@ void bgDrawOneChip(s32 x, s32 y, s32 xs, s32 ys, s32 gbix, u32 vtxCol, s32 ofsPa
             return;
         }
 
-        if(ppg_w.cur->tex->srcAdrs == NULL)
-            return;
+        /* (Removed) a srcAdrs==NULL early-return here skipped every chip
+         * whose texture group had released its source data — but that is a
+         * NORMAL state (groups free their source after texture creation),
+         * and such chips are meant to draw through ppgWriteQuadUseTrans's
+         * whole-quad fallback branch, which handles NULL srcAdrs itself.
+         * The guard was hiding solid backdrops, the character/stage-select
+         * background, and patches of the score screen. */
 
+        /* Background chips draw through the renderer's shared atlas again
+         * (batched: all same-strip chips are one draw call). The earlier
+         * forced pool bypass here (gpu_cache_prefer_pool toggle) papered
+         * over a cache-lifecycle bug since fixed at the source: palette
+         * destroy/recreate cycling killed and duplicated cache entries every
+         * frame, exhausting atlas cells and silently dropping chips — see
+         * cache_invalidate_palette and cache_create's resurrection scan in
+         * ctr_game_renderer.c. The pool detour cost one draw call PER CHIP
+         * (thousands per frame with parallax stages), which had become the
+         * dominant GPU-side frame cost. */
         ppgWriteQuadUseTrans(scrDrawPos, vtxCol, 0, gbix, 0, 0, ofsPal);
     }
 }
@@ -1142,10 +1160,15 @@ void ppgCalScrPosition(s32 x, s32 y, s32 xs, s32 ys) {
     scrDrawPos[2].y = scrDrawPos[3].y = point[1].y;
     scrDrawPos[0].z = scrDrawPos[1].z = scrDrawPos[2].z = scrDrawPos[3].z = point[0].z;
 
-    scrDrawPos[0].u = (f32)((x & 0x7F) >> 7);
-    scrDrawPos[0].v = (f32)((y & 0x7F) >> 7);
-    scrDrawPos[3].u = (f32)(((x & 0x7F) + xs) >> 7);
-    scrDrawPos[3].v = (f32)(((y & 0x7F) + ys) >> 7);
+    /* Native renderer expects NORMALIZED [0,1] UVs. The old integer >>7 here
+     * truncated every sub-128px scroll offset to 0/1 (x&0x7F is always <128,
+     * so (x&0x7F)>>7 == 0), collapsing the backdrop tiles' UVs — missing or
+     * quantized-jumping stage backdrops, char-select and score backgrounds.
+     * Divide by the 128px chip size instead, matching the reference tree. */
+    scrDrawPos[0].u = (f32)(x & 0x7F) / 128.0f;
+    scrDrawPos[0].v = (f32)(y & 0x7F) / 128.0f;
+    scrDrawPos[3].u = (f32)((x & 0x7F) + xs) / 128.0f;
+    scrDrawPos[3].v = (f32)((y & 0x7F) + ys) / 128.0f;
     scrDrawPos[1].u = scrDrawPos[3].u;
     scrDrawPos[2].u = scrDrawPos[0].u;
     scrDrawPos[1].v = scrDrawPos[0].v;

@@ -38,6 +38,7 @@ s32 flReleasePaletteHandle(u32 palette_handle);
 s32 flLockPalette(Rect* lprect, u32 th, plContext* lpcontext, u32 flag);
 s32 flUnlockPalette(u32 th);
 s32 flSetRenderState(enum _FLSETRENDERSTATE func, u32 value);
+f32 flPS2ConvScreenFZ(f32 z); /* game z -> PS2-style depth (native renderer) */
 
 // memory management
 s32 flInitialize(s32 /* unused */, s32 /* unused */);

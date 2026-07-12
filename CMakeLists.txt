@@ -150,10 +150,10 @@ set(CMD_LIST
     "19|remy bottom screen.png"
     "0|gill bottom screen.png"
     "18|twelve bottom screen.png"
-    "3|yun bottom screen.jpg"
-    "10|yang bottom screen.jpg"
-    "12|sean bottom screen.jpg"
-    "13|urien bottom screen.jpg")
+    "3|yun bottom screen.png"
+    "10|yang bottom screen.png"
+    "12|sean bottom screen.png"
+    "13|urien bottom screen.png")
 set(CMD_T3X_OUTPUTS "")
 foreach(entry ${CMD_LIST})
     string(REPLACE "|" ";" parts "${entry}")
@@ -172,6 +172,34 @@ endforeach()
 if(CMD_T3X_OUTPUTS)
     add_custom_target(cmd_t3x ALL DEPENDS ${CMD_T3X_OUTPUTS})
     add_dependencies(${PROJECT_NAME} cmd_t3x)
+endif()
+
+# On-screen button glyphs (Nintendo Switch icon set): one packed sheet, sub-
+# index order MUST match btn_label_index()'s tbl[] in src/ctr/gu_draw.c
+# (A,B,X,Y,L,R,ZL,ZR).
+set(BTN_DIR "C:/Users/temz1/OneDrive/Documents/sf3 testing/Switch")
+set(BTN_LIST
+    "Switch_A.png"
+    "Switch_B.png"
+    "Switch_X.png"
+    "Switch_Y.png"
+    "Switch_LB.png"
+    "Switch_RB.png"
+    "Switch_LT.png"
+    "Switch_RT.png")
+set(BTN_INPUTS "")
+foreach(fname ${BTN_LIST})
+    list(APPEND BTN_INPUTS "${BTN_DIR}/${fname}")
+endforeach()
+if(EXISTS "${BTN_DIR}")
+    add_custom_command(
+        OUTPUT ${ROMFS_DIR}/buttons.t3x
+        COMMAND ${CTR_TEX3DS_EXE} --atlas -o ${ROMFS_DIR}/buttons.t3x ${BTN_INPUTS}
+        DEPENDS ${BTN_INPUTS}
+        COMMENT "Converting Switch button icons -> romfs/buttons.t3x")
+    add_custom_target(buttons_t3x ALL DEPENDS ${ROMFS_DIR}/buttons.t3x)
+    add_dependencies(${PROJECT_NAME} buttons_t3x)
+    message(STATUS "Button glyphs: ${BTN_DIR} -> buttons.t3x")
 endif()
 
 ctr_create_3dsx(${PROJECT_NAME}

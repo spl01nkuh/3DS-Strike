@@ -6,6 +6,7 @@
 
 extern TexturePoolUsed* tpu_free; // size: 0x4, address: 0x579A8C
 extern u8* texcash_melt_buffer;   // size: 0x4, address: 0x579A90
+extern u32 texcash_purge_counts[24]; /* native-renderer profile counter */
 
 void disp_texcash_free_area();
 void init_texcash_1st();

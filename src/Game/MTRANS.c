@@ -1,6 +1,7 @@
 #include "Game/MTRANS.h"
 #include "common.h"
 #include "common/graphics.h"
+#include "ctr/ctr_game_renderer.h"
 //#include "sf33rd/AcrSDK/ps2/flps2render.h"
 //#include "sf33rd/AcrSDK/ps2/foundaps2.h"
 #include "fl.h"
@@ -117,6 +118,342 @@ static inline void lz_ext_p6_fx(u8* srcptr, u8* dstptr, u32 len);
 static void lz_ext_p6_cx(u8* srcptr, u16* dstptr, u32 len, u16* palptr);
 static inline u16 x16_mapping_set(PatternMap* map, s32 code);
 static inline u16 x32_mapping_set(PatternMap* map, s32 code);
+
+/* ---- 3DS BACKGROUND PREWARM -------------------------------------------
+ * First-use of a move used to hitch: its tiles LZ-decompress + GPU-upload
+ * synchronously mid-fight. With lazy slot release (see texcash.c), decoded
+ * tiles now persist — so we can decode a character's WHOLE tile set ahead
+ * of time and it stays warm. A (mt, group) pair self-registers on its first
+ * pattern build (this happens during the round-intro poses), and
+ * mlt_prewarm_tick() — called once per frame from texture_cash_update() —
+ * walks the group's full CG table decoding missing tiles under a strict
+ * per-frame time budget. By "FIGHT!" both characters are fully decoded. */
+/* P1-vs-P2 char-select diagnosis: per-group pattern-instance cache hit/build
+ * counters. A parked preview that keeps BUILDING (vs hitting) means its CG
+ * loop cycles the 64-entry PatternCollection pool → constant rebuild work.
+ * Read as deltas by the GRPSTAT probe (texcash.c). */
+u32 g_pat_build[24];
+u32 g_pat_hit[24];
+
+#define PREWARM_JOBS_MAX 12 /* fights can now register fx + cx jobs per
+                             * player plus stage/menu groups */
+typedef struct {
+    MultiTexture* mt;
+    s32 group;
+    s32 palo;      /* cx mode: the player's color code (wk->colcd) */
+    u32 next_cg;
+    u32 decoded;   /* wrap guard: stop if we decode more than capacity */
+    u8 state;      /* 0=free 1=running 2=done */
+    u8 cx;         /* 0 = indexed tiles (lz_ext_p6_fx, palt 0)
+                      1 = palette-BAKED 16-bit tiles (lz_ext_p6_cx with
+                          ColorRAM[(attr&0x1FF)+palo], upload size<<1) —
+                          the path every NON-DEFAULT player color uses; the
+                          fx-only prewarm covered none of it (user-confirmed
+                          first-use stutter when playing an alt color). */
+} PrewarmJob;
+static PrewarmJob prewarm_jobs[PREWARM_JOBS_MAX];
+extern const u8 obj_group_table[37664];
+extern u16 ColorRAM[512][64];
+
+void mlt_prewarm_reset(void) {
+    for (int i = 0; i < PREWARM_JOBS_MAX; i++)
+        prewarm_jobs[i].state = 0;
+}
+
+/* Loading-window support (user plan: preload around scene transitions).
+ * While boosted, the per-frame tick budget grows ~3x so whole charsets
+ * finish decoding inside the VS card / round intro / fades instead of
+ * trickling at 1.5ms into gameplay. Armed on every G_No scene change
+ * (texcash.c), which covers all four planned transition points. */
+static u32 prewarm_boost_frames = 0;
+
+void mlt_prewarm_boost(u32 frames) {
+    if (frames > prewarm_boost_frames)
+        prewarm_boost_frames = frames;
+}
+
+/* Re-arm completed jobs so a new scene re-verifies its groups (tiles may
+ * have been evicted since; already-cached tiles skip instantly). */
+void mlt_prewarm_restart(void) {
+    for (int i = 0; i < PREWARM_JOBS_MAX; i++) {
+        if (prewarm_jobs[i].state == 2) {
+            prewarm_jobs[i].state = 1;
+            prewarm_jobs[i].next_cg = 0;
+            prewarm_jobs[i].decoded = 0;
+        }
+    }
+}
+
+static void prewarm_register_mode(MultiTexture* mt, s32 group, u8 cx, s32 palo) {
+    int free_i = -1;
+    if (!mt) return;
+    for (int i = 0; i < PREWARM_JOBS_MAX; i++) {
+        if (prewarm_jobs[i].state != 0 &&
+            prewarm_jobs[i].mt == mt && prewarm_jobs[i].group == group &&
+            prewarm_jobs[i].cx == cx && prewarm_jobs[i].palo == palo)
+            return; /* already running or done */
+        if (prewarm_jobs[i].state == 0 && free_i < 0)
+            free_i = i;
+    }
+    if (free_i < 0) return;
+    prewarm_jobs[free_i].mt = mt;
+    prewarm_jobs[free_i].group = group;
+    prewarm_jobs[free_i].palo = palo;
+    prewarm_jobs[free_i].cx = cx;
+    prewarm_jobs[free_i].next_cg = 0;
+    prewarm_jobs[free_i].decoded = 0;
+    prewarm_jobs[free_i].state = 1;
+}
+
+static void prewarm_register(MultiTexture* mt, s32 group) {
+    prewarm_register_mode(mt, group, 0, 0);
+}
+
+/* allocate a slot for prewarmed content: cached-but-unreferenced (time=0).
+ * Returns slot index if the tile needs decoding, -1 if already cached or no
+ * slot is available. Mirrors get_mltbuf16_ext_2 minus PatternInstance maps. */
+/* Prewarm slot claim: FREE slots only — NEVER evict. An earlier version
+ * clock-evicted time<=0 slots; walking a full charset through a smaller
+ * cache then perpetually evicted the game's own on-demand-cached tiles
+ * (including ones about to be drawn), so first-use missed everything again
+ * AND the churn flooded the renderer with rebuilds (measured: BUILDSPIKE
+ * 97→522). Returns: slot index to decode, -1 = already cached (skip),
+ * -2 = cache full (job should stop — prewarm is opportunistic only). */
+static s32 prewarm_slot16(MultiTexture* mt, u32 code, u32 palt) {
+    PatternState* mc = mt->mltcsh16;
+    u16* used = mt->tpu->x16_used;
+    for (s32 i = 0; i < mt->tpu->x16; i++) {
+        if (mc[used[i]].cs.code == code && mc[used[i]].state == palt)
+            return -1; /* already cached */
+    }
+    if ((mt->tpu->x16 != mt->mltnum16) && mt->tpf->x16) {
+        mt->tpf->x16 -= 1;
+        u16 slot = mt->tpf->x16_free[mt->tpf->x16];
+        mt->tpu->x16_used[mt->tpu->x16] = slot;
+        mt->tpu->x16 += 1;
+        mc[slot].cs.code = code;
+        mc[slot].state = palt;
+        mc[slot].time = 0;
+        return slot;
+    }
+    return -2; /* no free slot — leave the live cache alone */
+}
+
+/* Non-ext (lifetime-based) groups — menus, HUD, objects — have NO tpf/tpu
+ * lists; their slots live or die by a per-slot countdown that
+ * mlt_obj_trans_update decrements every frame. Prewarm mirrors
+ * get_mltbuf16/32: find the code, else claim a code==-1 slot with the
+ * group's normal lifetime, so prewarmed tiles decay exactly like real use
+ * (never starving the cache). */
+static s32 prewarm_slot16_life(MultiTexture* mt, u32 code, u32 palt) {
+    PatternState* mc = mt->mltcsh16;
+    s32 b = -1;
+    for (s32 i = 0; i < mt->mltnum16; i++) {
+        if (mc[i].cs.code == code && mc[i].state == palt)
+            return -1; /* already cached */
+        if (mc[i].cs.code == -1 && b < 0)
+            b = i;
+    }
+    if (b < 0) return -2; /* full — real users take priority */
+    mc[b].cs.code = code;
+    mc[b].state = palt;
+    mc[b].time = mt->mltcshtime16;
+    return b;
+}
+
+static s32 prewarm_slot32_life(MultiTexture* mt, u32 code, u32 palt) {
+    PatternState* mc = mt->mltcsh32;
+    s32 b = -1;
+    for (s32 i = 0; i < mt->mltnum32; i++) {
+        if (mc[i].cs.code == code && mc[i].state == palt)
+            return -1;
+        if (mc[i].cs.code == -1 && b < 0)
+            b = i;
+    }
+    if (b < 0) return -2;
+    mc[b].cs.code = code;
+    mc[b].state = palt;
+    mc[b].time = mt->mltcshtime32;
+    return b;
+}
+
+static s32 prewarm_slot32(MultiTexture* mt, u32 code, u32 palt) {
+    PatternState* mc = mt->mltcsh32;
+    u16* used = mt->tpu->x32_used;
+    for (s32 i = 0; i < mt->tpu->x32; i++) {
+        if (mc[used[i]].cs.code == code && mc[used[i]].state == palt)
+            return -1;
+    }
+    if ((mt->tpu->x32 != mt->mltnum32) && mt->tpf->x32) {
+        mt->tpf->x32 -= 1;
+        u16 slot = mt->tpf->x32_free[mt->tpf->x32];
+        mt->tpu->x32_used[mt->tpu->x32] = slot;
+        mt->tpu->x32 += 1;
+        mc[slot].cs.code = code;
+        mc[slot].state = palt;
+        mc[slot].time = 0;
+        return slot;
+    }
+    return -2; /* no free slot — see prewarm_slot16 */
+}
+
+void mlt_prewarm_tick(void) {
+    /* NOT during character select: the hovered character's super-art preview
+     * animates from the very sheets the prewarm would be writing — the
+     * region-update churn made P1's preview visibly slow (P2, which triggers
+     * no hover loads, stayed full speed; user-reproduced). The round intro
+     * still gives the prewarm ~3s before the first playable frame. */
+    extern u8 G_No[4];
+    if (G_No[0] == 2 && G_No[1] == 1) return;
+
+    /* ~1.5ms budget per frame normally; ~5ms inside a post-transition
+     * loading window (VS card, round intro, fades — scenes with slack),
+     * so whole charsets finish before gameplay. */
+    u64 budget = (u64)(0.0015 * 268111856.0);
+    if (prewarm_boost_frames) {
+        prewarm_boost_frames--;
+        budget = (u64)(0.005 * 268111856.0);
+    }
+    u64 t0 = svcGetSystemTick();
+
+    /* njReLoadTexturePartNumG uploads through the GLOBAL current-data-list
+     * (ppg_w.cur) — the real decode sites run with the group's list already
+     * current, but this tick runs at an arbitrary point in the frame. Set
+     * the target group's list per job and restore the game's afterward;
+     * without this, prewarm uploads wrote tiles into UNRELATED groups
+     * (user-visible sprite flicker + palette corruption). */
+    extern void* ppgGetCurrentDataListPtr(void);
+    extern void ppgSetCurrentDataListPtr(void* p);
+    void* saved_dlist = ppgGetCurrentDataListPtr();
+
+    /* Two passes: CX jobs (real player colors) FIRST. The fx (palt=0) job
+     * for a group a colored player uses would otherwise fill the whole free
+     * pool with palette-0 tiles that player never draws, and the cx job
+     * would then hit cache-full immediately — measured: a colored player's
+     * special produced a 24-frame melt wall because its REAL tiles never
+     * got prewarmed. An fx job is skipped outright when a cx twin exists. */
+    for (int pass = 0; pass < 2; pass++) {
+    for (int j = 0; j < PREWARM_JOBS_MAX; j++) {
+        PrewarmJob* job = &prewarm_jobs[j];
+        if (job->state != 1) continue;
+        if (pass == 0 && !job->cx) continue; /* cx first */
+        if (pass == 1 && job->cx) continue;
+        if (!job->cx) {
+            int has_cx_twin = 0;
+            for (int k = 0; k < PREWARM_JOBS_MAX; k++) {
+                if (prewarm_jobs[k].state != 0 && prewarm_jobs[k].cx &&
+                    prewarm_jobs[k].mt == job->mt &&
+                    prewarm_jobs[k].group == job->group) {
+                    has_cx_twin = 1;
+                    break;
+                }
+            }
+            if (has_cx_twin) { job->state = 2; continue; }
+        }
+        MultiTexture* mt = job->mt;
+        s32 grp = job->group;
+        if (!texgrplds[grp].ok) { job->state = 2; continue; }
+        ppgSetCurrentDataListPtr((void*)&mt->texList);
+
+        u32* textbl = (u32*)texgrplds[grp].texture_table;
+        u32* trstbl = (u32*)texgrplds[grp].trans_table;
+        u32 cap = (u32)(mt->mltnum16 + mt->mltnum32);
+        /* Both tables are SELF-DESCRIBING: entry 0's byte offset delimits the
+         * offset-index array itself, giving exact entry counts. Walking past
+         * these bounds fed garbage to the LZ decompressor (scratch-buffer
+         * overrun → the "holes in sprites" corruption). */
+        u32 n_max = trstbl[0] >> 2;
+        u32 code_max = textbl[0] >> 2;
+
+        while (job->next_cg < sizeof(obj_group_table)) {
+            u32 cg = job->next_cg;
+            if (obj_group_table[cg] != (u8)grp) { job->next_cg++; continue; }
+            s32 n = (s32)cg - (s32)texgrpdat[grp].num_of_1st;
+            if (n < 0 || (u32)n >= n_max) { job->next_cg++; continue; }
+            if (trstbl[n] == 0 || (trstbl[n] & 1)) { job->next_cg++; continue; }
+
+            u16* trsbas = (u16*)((uintptr_t)trstbl + trstbl[n]);
+            s32 count = *trsbas;
+            trsbas++;
+            TileMapEntry* trsptr = (TileMapEntry*)trsbas;
+            s32 cache_full = 0;
+            if (count > 0 && count <= 64) { /* sanity guard on table holes */
+                PatternCode cc;
+                cc.parts.group = grp;
+                for (s32 c = 0; c < count; c++, trsptr++) {
+                    if ((u32)trsptr->code >= code_max) continue; /* hole */
+                    if (textbl[trsptr->code] == 0) continue;
+                    TEX* texptr = (TEX*)((uintptr_t)textbl + textbl[trsptr->code]);
+                    s32 wh = (texptr->wh & 3) + 1;
+                    s32 size = (wh * wh) << 6;
+                    cc.parts.offset = trsptr->code;
+                    /* cx jobs: palette baked per tile, same formula as the
+                     * rgb builder (palt = (attr & 0x1FF) + player colcd) */
+                    u32 palt = 0;
+                    if (job->cx) {
+                        palt = (u32)((trsptr->attr & 0x1FF) + job->palo);
+                        if (palt >= 512) continue; /* ColorRAM bound */
+                    }
+                    s32 slot = -1;
+                    if (wh == 1 || wh == 2) {
+                        slot = mt->ext ? prewarm_slot16(mt, cc.code, palt)
+                                       : prewarm_slot16_life(mt, cc.code, palt);
+                        if (slot >= 0) {
+                            if (job->cx) {
+                                lz_ext_p6_cx(&((u8*)texptr)[1], (u16*)mt->mltbuf,
+                                             size, (u16*)(ColorRAM[palt]));
+                                njReLoadTexturePartNumG(mt->mltgidx16 + (slot >> 8),
+                                                        mt->mltbuf, slot & 0xFF, size << 1);
+                            } else {
+                                lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+                                njReLoadTexturePartNumG(mt->mltgidx16 + (slot >> 8),
+                                                        mt->mltbuf, slot & 0xFF, size);
+                            }
+                            job->decoded++;
+                        }
+                    } else if (wh == 4) {
+                        slot = mt->ext ? prewarm_slot32(mt, cc.code, palt)
+                                       : prewarm_slot32_life(mt, cc.code, palt);
+                        if (slot >= 0) {
+                            if (job->cx) {
+                                lz_ext_p6_cx(&((u8*)texptr)[1], (u16*)mt->mltbuf,
+                                             size, (u16*)(ColorRAM[palt]));
+                                njReLoadTexturePartNumG(mt->mltgidx32 + (slot >> 6),
+                                                        mt->mltbuf, slot & 0x3F, size << 1);
+                            } else {
+                                lz_ext_p6_fx(&((u8*)texptr)[1], mt->mltbuf, size);
+                                njReLoadTexturePartNumG(mt->mltgidx32 + (slot >> 6),
+                                                        mt->mltbuf, slot & 0x3F, size);
+                            }
+                            job->decoded++;
+                        }
+                    }
+                    /* wh==3: not a valid size class — table hole, skip */
+                    if (slot == -2) { cache_full = 1; break; }
+                    /* honest budget: a 40-tile CG can blow well past the
+                     * limit if only checked between CGs. Mid-list resume
+                     * is safe: cached tiles skip instantly next tick. */
+                    if ((c & 7) == 7 && svcGetSystemTick() - t0 > budget) {
+                        ppgSetCurrentDataListPtr(saved_dlist);
+                        return;
+                    }
+                }
+            }
+            if (cache_full) { job->state = 2; break; } /* opportunistic only */
+            job->next_cg++;
+
+            if (job->decoded > cap) { job->state = 2; break; } /* wrapped capacity */
+            if (svcGetSystemTick() - t0 > budget) {
+                ppgSetCurrentDataListPtr(saved_dlist);
+                return; /* resume next frame */
+            }
+        }
+        if (job->next_cg >= sizeof(obj_group_table)) job->state = 2;
+    }
+    } /* pass loop */
+    ppgSetCurrentDataListPtr(saved_dlist);
+}
+/* ---- end 3DS BACKGROUND PREWARM ---------------------------------------- */
 
 static void search_trsptr(uintptr_t trstbl, s32 i, s32 n, s32 cods, s32 atrs, s32 codd, s32 atrd) {
     s32 j;
@@ -424,6 +761,9 @@ void mlt_obj_trans_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
         return;
     }
 
+    prewarm_register(mt, i); /* 3DS: queue background decode of this whole
+                                group's tiles (see mlt_prewarm_tick) */
+
     n -= texgrpdat[i].num_of_1st;
     trsbas = (u16*)(texgrplds[i].trans_table + ((u32*)texgrplds[i].trans_table)[n]);
     textbl = (u32*)texgrplds[i].texture_table;
@@ -444,6 +784,7 @@ void mlt_obj_trans_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
     cc.parts.group = 0;
     cc.parts.offset = wk->cg_number;
     ix = check_patcash_ex_trans(mt->cpat, cc.code);
+    if (mt->id < 24) { if (ix < 0) g_pat_build[mt->id]++; else g_pat_hit[mt->id]++; }
 
     u16 x_flip = attr & 0x8000;
     u16 y_flip = attr & 0x4000;
@@ -690,6 +1031,9 @@ void mlt_obj_trans(MultiTexture* mt, WORK* wk, s32 base_y) {
         return;
     }
 
+    prewarm_register(mt, i); /* 3DS: queue background decode of this whole
+                                group's tiles (see mlt_prewarm_tick) */
+
     n -= texgrpdat[i].num_of_1st;
     trsbas = (u16*)(texgrplds[i].trans_table + ((u32*)texgrplds[i].trans_table)[n]);
     textbl = (u32*)texgrplds[i].texture_table;
@@ -817,6 +1161,8 @@ void mlt_obj_trans_cp3_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
         return;
     }
 
+    prewarm_register(mt, i); /* 3DS background prewarm */
+
     n -= texgrpdat[i].num_of_1st;
     trsbas = (u16*)(texgrplds[i].trans_table + ((u32*)texgrplds[i].trans_table)[n]);
     textbl = (u32*)texgrplds[i].texture_table;
@@ -837,6 +1183,7 @@ void mlt_obj_trans_cp3_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
     cc.parts.group = 0;
     cc.parts.offset = wk->cg_number;
     ix = check_patcash_ex_trans(mt->cpat, cc.code);
+    if (mt->id < 24) { if (ix < 0) g_pat_build[mt->id]++; else g_pat_hit[mt->id]++; }
 
     u16 x_flip = flip & 0x8000;
     u16 y_flip = flip & 0x4000;
@@ -1098,6 +1445,8 @@ void mlt_obj_trans_cp3(MultiTexture* mt, WORK* wk, s32 base_y) {
         return;
     }
 
+    prewarm_register(mt, i); /* 3DS background prewarm */
+
     n -= texgrpdat[i].num_of_1st;
     trsbas = (u16*)(texgrplds[i].trans_table + ((u32*)texgrplds[i].trans_table)[n]);
     textbl = (u32*)texgrplds[i].texture_table;
@@ -1240,6 +1589,12 @@ void mlt_obj_trans_rgb_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
         return;
     }
 
+    /* 3DS: cx-mode prewarm — this path bakes the player's palette into
+     * 16-bit tiles (lz_ext_p6_cx with ColorRAM[(attr&0x1FF)+colcd]); it's
+     * what every NON-DEFAULT color uses, so the fx-only prewarm covered
+     * none of a colored player's charset (user-confirmed stutter). */
+    prewarm_register_mode(mt, i, 1, wk->colcd);
+
     n -= texgrpdat[i].num_of_1st;
     trsbas = (u16*)(texgrplds[i].trans_table + ((u32*)texgrplds[i].trans_table)[n]);
     textbl = (u32*)texgrplds[i].texture_table;
@@ -1260,6 +1615,7 @@ void mlt_obj_trans_rgb_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
     cc.parts.group = wk->colcd;
     cc.parts.offset = wk->cg_number;
     ix = check_patcash_ex_trans(mt->cpat, cc.code);
+    if (mt->id < 24) { if (ix < 0) g_pat_build[mt->id]++; else g_pat_hit[mt->id]++; }
 
 
     u16 x_flip = flip & 0x8000;
@@ -1499,6 +1855,9 @@ void mlt_obj_trans_rgb(MultiTexture* mt, WORK* wk, s32 base_y) {
         return;
     }
 
+    /* 3DS: cx-mode prewarm — see rgb_ext note. */
+    prewarm_register_mode(mt, i, 1, wk->colcd);
+
     n -= texgrpdat[i].num_of_1st;
     trsbas = (u16*)(texgrplds[i].trans_table + ((u32*)texgrplds[i].trans_table)[n]);
     textbl = (u32*)texgrplds[i].texture_table;
@@ -1669,25 +2028,16 @@ void seqsAfterProcess() {
     s32 i;
     u32 keep = 0;
     u32 val = 0;
-    TextureVertex *vertices, *vertices_temp;
-    FLTexture *tex = &flTexture[LO_16_BITS(val) - 1];
 
     if ((Debug_w[0x27] != 3) && (seqs_w.sprTotal != 0)) {
-        if (Debug_w[0x22]) {
-            for (i = 0; i < 24; i++) {
-                if (seqs_w.up[i]) {
+        for (i = 0; i < 24; i++) {
+            if (seqs_w.up[i]) {
+                if (Debug_w[0x22]) {
                     if (ppgCheckTextureDataBe(mts[i].texList.tex) == 0) {
                         seqs_w.up[i] = 0;
                     }
-                }
-            }
-        }
-        else {
-            for (i = 0; i < 24; i++) {
-                if (seqs_w.up[i]) {
-                    if (ppgRenewTexChunkSeqs(mts[i].texList.tex) == 0) {
-                        seqs_w.up[i] = 0;
-                    }
+                } else if (ppgRenewTexChunkSeqs(mts[i].texList.tex) == 0) {
+                    seqs_w.up[i] = 0;
                 }
             }
         }
@@ -1696,76 +2046,18 @@ void seqsAfterProcess() {
             seqs_w.sprMax = seqs_w.sprTotal;
         }
 
-        if(DEMMA_DEBUG || skip_frame)
-                return;
-
-        vertices = vertices_temp = (TextureVertex*)sceGuGetMemory(2 * seqs_w.sprTotal * sizeof(TextureVertex));
-        if(vertices == NULL)
-            return;
-        int k = 0, j, w = 0;
-        u32 val_temp = -1;
-
-        Sprite2 *c;
-        Vec3 *vert;
-        TexCoord *tc;
-
-        u32 color_temp;
-
         for (i = 0; i < seqs_w.sprTotal; i++) {
-            c = &seqs_w.chip[i];
-            if (seqs_w.up[c->id]) {
+            if (seqs_w.up[seqs_w.chip[i].id]) {
                 val = seqs_w.chip[i].tex_code;
 
-                tex = &flTexture[LO_16_BITS(val) - 1];
-
-                color_temp = fixARGB(c->vertex_color);
-
-                #ifdef SCALE_WITH_VFPU
-                vert = &c->v[0];
-                __asm__ volatile (
-                    "mtv %4, S000\n"    // load vert->x to matrix
-                    "mtv %5, S001\n"    // load vert->y to matrix
-                    "mtv %6, S002\n"    // load vert->x to matrix
-                    "mtv %7, S003\n"    // load vert->y to matrix
-
-                    "vmul.q C000, C000, C410\n" // multiply matrix (scale)
-                    "vadd.q C000, C000, C420\n" // add matrix (offset)
-
-                    "mfv %0, S000\n"    // store in verticex->x
-                    "mfv %1, S001\n"    // store in verticex->y
-                    "mfv %2, S002\n"    // store in verticex->x
-                    "mfv %3, S003\n"    // store in verticex->y
-                    : "=r"(vertices[0].x), "=r"(vertices[0].y), "=r"(vertices[1].x), "=r"(vertices[1].y)
-                    // %0 = vertices->x, %1 = vertices->y;
-                    : "r"(vert[0].x), "r"(vert[0].y), "r"(vert[1].x), "r"(vert[1].y)
-                    // %2 = vert->x, %3 = vert->y;
-                );
-                #endif
-                for (j = 0; j < 2; j++) {
-                    vert = &c->v[j];
-                    tc = &c->t[j];
-                    #ifndef SCALE_WITH_VFPU
-                    vertices->x = (s32)SCALE_X(vert->x);
-                    vertices->y = (s32)SCALE_Y(vert->y);
-                    #endif
-                    vertices->z = vert->z;
-                    vertices->u = tc->s;
-                    vertices->v = tc->t;
-                    vertices->colour = color_temp;
-                    vertices++;
-                }
-
-                if(val != val_temp){
-                    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, k - w, 0, &vertices_temp[w]);
-                    w = k;
-                    val_temp = val;
+                if (keep != val) {
+                    keep = val;
                     flSetRenderState(FLRENDER_TEXSTAGE0, val);
                 }
-                
-                k += 2;
+
+                SDLGameRenderer_DrawSprite2(&seqs_w.chip[i]);
             }
         }
-        sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_COLOR_8888 | GU_VERTEX_32BITF | GU_TRANSFORM_2D, k - w, 0, &vertices_temp[w]);
     }
 }
 
@@ -1801,20 +2093,24 @@ s32 seqsStoreChip(f32 x, f32 y, s32 w, s32 h, s32 gix, s32 code, s32 attr, s32 a
 
     appRenewTempPriority_1_Chip();
 
+    /* Native renderer expects NORMALIZED [0,1] texture coordinates (its
+     * atlas/pool UV remap multiplies by src_w/strip_w) — the old PSP
+     * pipeline consumed raw texel coords here. Divide by the 256px sheet
+     * size, matching the reference tree's seqsStoreChip. */
     if (attr & 0x8000) {
-        chip->t[1].s = u;
-        chip->t[0].s = u + w;
+        chip->t[1].s = u / 256.0f;
+        chip->t[0].s = (u + w) / 256.0f;
     } else {
-        chip->t[0].s = u;
-        chip->t[1].s = u + w;
+        chip->t[0].s = u / 256.0f;
+        chip->t[1].s = (u + w) / 256.0f;
     }
 
     if (attr & 0x4000) {
-        chip->t[1].t = v;
-        chip->t[0].t = v + h;
+        chip->t[1].t = v / 256.0f;
+        chip->t[0].t = (v + h) / 256.0f;
     } else {
-        chip->t[0].t = v;
-        chip->t[1].t = v + h;
+        chip->t[0].t = v / 256.0f;
+        chip->t[1].t = (v + h) / 256.0f;
     }
 
     chip->tex_code |= ppgGetUsingPaletteHandle(NULL, attr & 0x1FF) << 16;
@@ -1922,6 +2218,22 @@ static s32 get_mltbuf16_ext_2(MultiTexture* mt, u32 code, u32 palt, s32* ret, Pa
                 mc[*tpu_x16].time += 1;
             }
 
+            /* 3DS: promote toward the front (halving). Under lazy release
+             * the used list stays permanently FULL, and screens that rebuild
+             * pattern instances every frame (char-select preview: 2-frame
+             * instance life, ~31 chips) were paying full-list linear scans
+             * per chip per frame (~1.2M iterations/s, measured via GRPACT —
+             * and the P1-slower asymmetry was just P1's fuller list). The
+             * hot loop's chips migrate to the head; scans collapse to
+             * ~loop size. The list is an unordered set — order is free. */
+            if (i > 0) {
+                u16* head = mt->tpu->x16_used;
+                s32 j = i >> 1;
+                u16 tmp = head[i];
+                head[i] = head[j];
+                head[j] = tmp;
+            }
+
             return 0;
         }
         tpu_x16++;
@@ -1941,6 +2253,37 @@ static s32 get_mltbuf16_ext_2(MultiTexture* mt, u32 code, u32 palt, s32* ret, Pa
         }
 
         return 1;
+    }
+
+    /* 3DS LAZY RELEASE: no fresh slot — evict an unreferenced CACHED slot
+     * (time<=0: every instance that mapped it has expired; see texcash.c
+     * update_with_tpu_free, which now keeps identities instead of wiping).
+     * RANDOMIZED start (LCG): a looping animation whose tile set exceeds
+     * capacity (char-select super-art preview, measured) hits 100% misses
+     * under clock/LRU eviction (always evicts exactly what the loop needs
+     * next); random eviction retains ~capacity/loop of the set instead. */
+    /* clock-hand eviction (FIFO-ish). NOTE: randomized eviction was tried
+     * for the loop-exceeds-capacity case and made general play WORSE (it
+     * evicts uniformly, including tiles the current move decoded frames ago
+     * and still cycles) — reverted. */
+    {
+        static u32 clock16 = 0;
+        s32 n = mt->tpu->x16;
+        s32 k;
+        for (k = 0; k < n; k++) {
+            u16 slot = mt->tpu->x16_used[(clock16 + k) % n];
+            if (mc[slot].time <= 0) {
+                clock16 = (clock16 + k + 1) % (n > 0 ? (u32)n : 1u);
+                mc[slot].cs.code = code;
+                mc[slot].state = palt;
+                mc[slot].time = 1;
+                *ret = slot;
+                if (x16_mapping_set(&cp->map, *ret)) {
+                    cp->x16 += 1;
+                }
+                return 1;
+            }
+        }
     }
 
     // CG cache is full. x16 EXT2\n
@@ -1963,6 +2306,15 @@ static s32 get_mltbuf32_ext_2(MultiTexture* mt, u32 code, u32 palt, s32* ret, Pa
                 mc[*tpu_x32].time += 1;
             }
 
+            /* 3DS: halving promotion — see get_mltbuf16_ext_2 */
+            if (i > 0) {
+                u16* head = mt->tpu->x32_used;
+                s32 j = i >> 1;
+                u16 tmp = head[i];
+                head[i] = head[j];
+                head[j] = tmp;
+            }
+
             return 0;
         }
         tpu_x32++;
@@ -1982,6 +2334,27 @@ static s32 get_mltbuf32_ext_2(MultiTexture* mt, u32 code, u32 palt, s32* ret, Pa
         }
 
         return 1;
+    }
+
+    /* 3DS LAZY RELEASE eviction (clock) — see get_mltbuf16_ext_2. */
+    {
+        static u32 clock32 = 0;
+        s32 n = mt->tpu->x32;
+        s32 k;
+        for (k = 0; k < n; k++) {
+            u16 slot = mt->tpu->x32_used[(clock32 + k) % n];
+            if (mc[slot].time <= 0) {
+                clock32 = (clock32 + k + 1) % (n > 0 ? (u32)n : 1u);
+                mc[slot].cs.code = code;
+                mc[slot].state = palt;
+                mc[slot].time = 1;
+                *ret = slot;
+                if (x32_mapping_set(&cp->map, *ret)) {
+                    cp->x32 += 1;
+                }
+                return 1;
+            }
+        }
     }
 
     flLogOut("CG cache is full. x32 EXT2\n");

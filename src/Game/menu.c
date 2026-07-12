@@ -4205,7 +4205,7 @@ s32 Pause_1st_Sub(struct _TASK* task_ptr) {
 
     if (Pause_Down) {
         SSPutStr2(17, 12, 9, "PRESS   BUTTON");
-        dispButtonImage2(0xB2, 0x5B, 1, 0x13, 0xF, 0, 4);
+        dispButtonImage2(0xB2, 0x5B, 1, 0x13, 0xF, 0, 0); /* A = confirm, matches the SWK_WEST check below */
         SSPutStr2(18, 14, 9, "TO PAUSE MENU");
     }
 
@@ -4223,6 +4223,14 @@ s32 Pause_1st_Sub(struct _TASK* task_ptr) {
         return 1;
     }
 
+    /* SWK_SOUTH here, NOT SWK_WEST: this `sw` comes from plsw_00/01, fed by
+     * IOConv.c's keyConvert(), which runs pad.c's raw tp->sw through
+     * ioconv_table — a SECOND remap that swaps bits 0x10<->0x100 (WEST<->
+     * SOUTH) relative to pad.c's own domain. In THIS (post-keyConvert)
+     * domain, SWK_SOUTH is the bit physical A actually sets, and SWK_WEST is
+     * what physical X sets — the opposite of pad.c's tp->sw. Confirmed by
+     * tracing ioconv_table row {0x100,0x10}: pad.c bit 0x10 (KEY_A) sets
+     * output bit 0x100 (SWK_SOUTH). Matches the displayed "A" glyph above. */
     if (sw & SWK_SOUTH) {
         task_ptr->r_no[2] += 1;
         Cursor_Y_Pos[0][0] = 0;
