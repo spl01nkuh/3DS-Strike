@@ -12,4 +12,10 @@ YOU are responsible for providing a LEGITIMATE (NON-PIRATED, MOST LIKELY A PHYSI
 More information coming soon!
 
 # AI DISCLOSURE AND OTHER NOTES
-Claude was used to port the game to the 3DS. This is an experiment to see how far "vibe coding" can take me. However, contributions are greatly appreciated! Please reach out with tips and / or questions!
+Claude was used to port the game to the 3DS. This is an experiment to see how far "vibe coding" can take me. However, contributions are greatly appreciated! Please reach out with tips and / or questions! 
+
+# SPECIAL THANKS
+The entire 3SX community
+Giblet (for letting me use their 3DS renderer)
+Demis98 (this is based off of their PSP port)
+My credit card (paid for Claude Pro)
