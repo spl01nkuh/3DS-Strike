@@ -248,6 +248,10 @@ void texture_cash_update() {
      * first-use of every move runs at full speed (see MTRANS.c). */
     { extern void mlt_prewarm_tick(void); mlt_prewarm_tick(); }
 
+    /* 3DS: boot-time background preload of known one-shot monster files
+     * (8.8MB select-screen bundle etc.) into the AFS cache — see afs.c. */
+    { extern void afsPreloadPump(void); afsPreloadPump(); }
+
     /* 3DS LOADING WINDOWS (user plan): every scene transition (G_No change —
      * covers boot→attract, →char select, →VS/fight, fight→score, all four
      * planned points) arms a ~4s boosted-decode window and re-arms completed

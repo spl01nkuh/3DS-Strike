@@ -311,6 +311,21 @@ s32 load_it_use_this_key(u16 fnum, s16 key) {
     return err;
 }
 
+/* True while any load request is queued — the AFS boot preloader (afs.c
+ * afsPreloadPump) checks this so it never steals the I/O thread from a real
+ * load, which would push that load onto the blocking sync path. */
+s32 LDREQ_Queue_Busy(void) {
+    s16 i;
+
+    for (i = 0; i < (s16)(sizeof(q_ldreq) / sizeof(REQ)); i++) {
+        if (q_ldreq[i].be) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 void Init_Load_Request_Queue_1st() {
     s16 i;
 
