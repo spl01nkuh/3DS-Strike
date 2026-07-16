@@ -255,12 +255,32 @@ typedef struct {
     size_t byte_size;
     u32 checksum;
     bool valid;
-    u32 tile_dirty[TILE_DIRTY_WORDS]; /* bitmask of recently-written tiles */
+    u32 tile_dirty[TILE_DIRTY_WORDS]; /* bitmask of recently-written tiles
+                                         (NEVER cleared per frame — the pool
+                                         build uses it as the ever-active-tile
+                                         mask) */
     bool has_region_updates;          /* true if any tile_dirty bit set */
     bool is_placeholder;              /* true if pixels currently points at the
                                           mode=0 all-zero wkVram buffer rather
                                           than real mem_handle/lock_ptr content */
+    /* MELT COALESCING: tiles melted THIS frame, cleared by
+     * melt_flush_pending(). Region notifies used to synchronously patch the
+     * L8 cache + every recent palette variant PER TILE (hundreds of times in
+     * a heavy animation frame = the MELTSPIKE stutter); now they only set
+     * bits here and the patch runs once per sheet per frame over coalesced
+     * tile runs. MUST cover the LARGEST sheet (512×512 = 4096 tiles) — the
+     * 1024-tile tile_dirty sizing silently dropped patches for the upper
+     * tile indices of 512-wide stage/super sheets (measured: garbage streaks
+     * in Ibuki-stage sky + super-KO palette glitches). */
+#define MELT_PENDING_WORDS 128 /* 4096 tiles = 512×512 / 64 */
+    u32 melt_pending[MELT_PENDING_WORDS];
+    bool melt_queued;                 /* already in melt_queue this frame */
 } SrcTexture;
+
+static void melt_flush_pending(void); /* defined after UpdateTextureRegion */
+static int melt_queue[64];
+static int melt_queue_n;
+static bool melt_queue_overflow;
 
 typedef struct {
     int count;
@@ -2069,12 +2089,21 @@ void SDLGameRenderer_ClearTileDirty(unsigned int th) {
     int idx = (int)th - 1;
     if (idx >= 0 && idx < FL_TEXTURE_MAX && src_textures[idx].valid) {
         memset(src_textures[idx].tile_dirty, 0, sizeof(src_textures[idx].tile_dirty));
+        memset(src_textures[idx].melt_pending, 0, sizeof(src_textures[idx].melt_pending));
+        src_textures[idx].melt_queued = false; /* stale true would block future
+                                                  flush queueing for this slot */
     }
 }
 
 void SDLGameRenderer_ZeroCacheTexture(unsigned int th) {
     int tex_idx = (int)th - 1;
     if (tex_idx < 0 || tex_idx >= FL_TEXTURE_MAX) return;
+
+    /* Cancel any melt patches still pending for this sheet: the zero must be
+     * the last writer. With deferred melt patching, a melt earlier in this
+     * frame would otherwise be repainted OVER the zeroed cells at frame end
+     * (measured: stale-palette sprite fragments on super-KO wipes). */
+    memset(src_textures[tex_idx].melt_pending, 0, sizeof(src_textures[tex_idx].melt_pending));
     for (int ci = 0; ci < CACHE_MAX; ci++) {
         CacheEntry* e = &gpu_cache[ci];
         if (!e->allocated || e->pending_delete) continue;
@@ -2844,6 +2873,12 @@ void SDLGameRenderer_RenderFrame(void) {
      * immediately before submitting, rather than trusting the one bind done
      * at BeginFrame. */
     imm_bind();
+
+    /* Apply this frame's coalesced melt patches (L8 + palette variants) —
+     * MUST precede atlas_flush_pending_strips so the patched strip bytes are
+     * what the GPU uploads. Runs even with no render tasks so pending melts
+     * don't carry stale GPU content into the next drawn frame. */
+    melt_flush_pending();
 
     if (render_task_count == 0) return;
 
@@ -3647,7 +3682,14 @@ void SDLGameRenderer_UpdateTextureRegion(unsigned int th, int x, int y, int w, i
     if (idx < 0 || idx >= FL_TEXTURE_MAX) return;
     dbg_regionupd_calls++;
 
-    /* Mark the affected 8×8 tiles as "active" in the dirty bitmap. */
+    /* Mark the affected 8×8 tiles in the ever-active bitmap AND the per-frame
+     * melt-pending bitmap. All patching (L8 index cache + palette-variant GPU
+     * rewrites) is DEFERRED to melt_flush_pending() at frame end: melts
+     * stream dozens-to-hundreds of tiles per heavy frame, and patching per
+     * notify multiplied that work by the live-variant count (the measured
+     * MELTSPIKE stutter). The CPU-side pixels (the patch source) are already
+     * final when this is called, so one coalesced patch per sheet per frame
+     * produces identical GPU content. */
     { SrcTexture* s = &src_textures[idx];
       if (s->valid && s->w > 0) {
           s->has_region_updates = true;
@@ -3661,135 +3703,186 @@ void SDLGameRenderer_UpdateTextureRegion(unsigned int th, int x, int y, int w, i
           for (int ty = ty0; ty < ty1; ty++) {
               for (int tx = tx0; tx < tx1; tx++) {
                   int tidx = ty * tiles_per_row + tx;
-                  if (tidx >= 0 && tidx < TILE_DIRTY_WORDS * 32)
+                  if (tidx < 0) continue;
+                  if (tidx < TILE_DIRTY_WORDS * 32)
                       s->tile_dirty[tidx >> 5] |= (1u << (tidx & 31));
+                  if (tidx < MELT_PENDING_WORDS * 32)
+                      s->melt_pending[tidx >> 5] |= (1u << (tidx & 31));
               }
+          }
+          if (!s->melt_queued) {
+              s->melt_queued = true;
+              if (melt_queue_n < (int)(sizeof(melt_queue) / sizeof(melt_queue[0])))
+                  melt_queue[melt_queue_n++] = idx;
+              else
+                  melt_queue_overflow = true; /* flush scans all textures */
+          }
+      } else {
+          /* Sheet not (currently) registered — no width to map tiles with,
+           * so the deferred bitmap can't represent this melt. The OLD
+           * per-notify code still patched variants here (its variant loop
+           * had no validity guard); dropping them loses the patch forever.
+           * Patch immediately with the raw rect — rare path, no perf cost. */
+          for (int i = 0; i < CACHE_MAX; i++) {
+              CacheEntry* e = &gpu_cache[i];
+              if (!e->allocated || e->pending_delete) continue;
+              if (e->texture_index != idx) continue;
+              cache_update_entry_region(e, x, y, w, h);
+              dbg_regionupd_patched++;
           }
       }
     }
+}
 
-    /* Patch the texture-keyed pool L8 index cache ONCE per notify (PSMT8):
-     * melting sheets keep their palette ticking, and with stale/invalidated
-     * indices every tick was a measured 6.8ms full rebuild — patched, it's
-     * a ~2ms fast re-resolve. Same morton/Y-flip convention as the pool
-     * build (gpu tile row = tiles_y-1-src_ty, fine row = morton_row[7-fy]). */
-    {
+/* Coalesced melt patch — runs ONCE per frame (RenderFrame, before the strip
+ * flush) instead of once per melted tile. For each sheet melted this frame:
+ * one CACHE_MAX scan for its live palette variants, one L8-cache lookup, then
+ * per horizontal RUN of dirty tiles: patch the L8 index cache and each
+ * recently-bound/pinned variant (stale variants are version-flipped once per
+ * flush — they full-rebuild IF ever bound again). Correctness: the CPU pixel
+ * buffer is written before each notify, so at flush time it holds the frame's
+ * final content; patched GPU data is identical to the old per-tile path, and
+ * ordering before atlas_flush_pending_strips() keeps the upload contract. */
+static void melt_flush_pending(void) {
+    int process_all = melt_queue_overflow ? FL_TEXTURE_MAX : melt_queue_n;
+
+    for (int q = 0; q < process_all; q++) {
+        int idx = melt_queue_overflow ? q : melt_queue[q];
         SrcTexture* s = &src_textures[idx];
-        if (s->valid && s->fmt == SCE_GS_PSMT8 && s->pixels) {
-            L8CacheEntry* l8p = l8_cache_find(idx, texture_versions[idx]);
+        if (!s->melt_queued && !melt_queue_overflow) continue;
+        s->melt_queued = false;
+        if (melt_queue_overflow) {
+            bool any = false;
+            for (int wd = 0; wd < TILE_DIRTY_WORDS; wd++)
+                if (s->melt_pending[wd]) { any = true; break; }
+            if (!any) continue;
+        }
+        if (!s->valid || s->w <= 0) {
+            /* Sheet vanished between notify and flush — KEEP the bits; a
+             * later melt re-queues this slot and flushes them once the sheet
+             * is registered again (clearing here would drop patches). */
+            continue;
+        }
+
+        int tiles_x = s->w / 8;
+        int tile_rows = s->h / 8;
+        if (tiles_x <= 0 || tile_rows <= 0) {
+            memset(s->melt_pending, 0, sizeof(s->melt_pending));
+            continue;
+        }
+
+        /* L8 index cache for this sheet (PSMT8), looked up once. Keeping it
+         * patched turns the next palette tick's 6.8ms full rebuild into a
+         * ~2ms fast re-resolve. */
+        L8CacheEntry* l8p = NULL;
+        const u8* px8 = NULL;
+        int ltx = 0, lty = 0;
+        if (s->fmt == SCE_GS_PSMT8 && s->pixels) {
+            l8p = l8_cache_find(idx, texture_versions[idx]);
             if (l8p && l8p->indices) {
-                const u8* px8 = (const u8*)s->pixels;
-                int ltx = l8p->pot_w >> 3;
-                int lty = l8p->pot_h >> 3;
-                int px0 = x >> 3, px1 = (x + w - 1) >> 3;
-                int py0 = y >> 3, py1 = (y + h - 1) >> 3;
-                for (int sty = py0; sty <= py1; sty++) {
-                    int ty = (lty - 1) - sty;
-                    if (ty < 0 || ty >= lty) continue;
-                    for (int tx = px0; tx <= px1 && tx < ltx; tx++) {
-                        if (tx < 0) continue;
-                        int stx = tx * 8, sy0 = sty * 8;
-                        u8* dst = &l8p->indices[(ty * ltx + tx) * 64];
-                        if (stx + 8 <= s->w && sy0 + 8 <= s->h) {
-                            for (int fy = 0; fy < 8; fy++) {
-                                const u8* srow = px8 + (sy0 + fy) * s->w + stx;
-                                const u8* m = morton_row[7 - fy];
-                                dst[m[0]] = srow[0]; dst[m[1]] = srow[1];
-                                dst[m[2]] = srow[2]; dst[m[3]] = srow[3];
-                                dst[m[4]] = srow[4]; dst[m[5]] = srow[5];
-                                dst[m[6]] = srow[6]; dst[m[7]] = srow[7];
-                            }
-                        } else {
-                            for (int fy = 0; fy < 8; fy++) {
-                                int sy = sy0 + fy;
-                                const u8* m = morton_row[7 - fy];
-                                for (int fx = 0; fx < 8; fx++) {
-                                    int sx = stx + fx;
-                                    dst[m[fx]] = (sx < s->w && sy < s->h)
-                                                     ? px8[sy * s->w + sx] : 0;
+                px8 = (const u8*)s->pixels;
+                ltx = l8p->pot_w >> 3;
+                lty = l8p->pot_h >> 3;
+            } else {
+                l8p = NULL;
+            }
+        }
+
+        /* Live cache entries (palette variants) of this sheet, scanned once.
+         * Recent/pinned ones get region patches; stale ones are invalidated
+         * once (rebuild-on-next-bind), same policy as the old per-tile path. */
+        CacheEntry* ents[16];
+        int en = 0;
+        for (int i = 0; i < CACHE_MAX; i++) {
+            CacheEntry* e = &gpu_cache[i];
+            if (!e->allocated || e->pending_delete) continue;
+            if (e->texture_index != idx) continue;
+            if (e->pinned || e->last_used_frame + 10 >= frame_number) {
+                if (en < 16) ents[en++] = e;
+                /* >16 recent variants: excess ones fall through to the
+                 * invalidation below — they rebuild on next bind (correct,
+                 * just slower); never observed (~5 typical). */
+                else if (e->atlas_cell >= 0) {
+                    e->tex_version = texture_versions[idx] ^ 0x80000000u;
+                    atlas_l8_valid[e->atlas_cell] = false;
+                } else {
+                    e->dirty = true;
+                }
+            } else if (e->atlas_cell >= 0) {
+                e->tex_version = texture_versions[idx] ^ 0x80000000u;
+                atlas_l8_valid[e->atlas_cell] = false;
+            } else {
+                e->dirty = true; /* pool find path honors dirty */
+            }
+        }
+
+        /* Walk dirty tiles row by row, coalescing horizontal runs. */
+        for (int ty = 0; ty < tile_rows; ty++) {
+            int row_base = ty * tiles_x;
+            int tx = 0;
+            while (tx < tiles_x) {
+                int tidx = row_base + tx;
+                if (tidx >= MELT_PENDING_WORDS * 32) break;
+                if (!(s->melt_pending[tidx >> 5] & (1u << (tidx & 31)))) {
+                    tx++;
+                    continue;
+                }
+                int tx0 = tx;
+                while (tx < tiles_x) {
+                    int ti2 = row_base + tx;
+                    if (ti2 >= MELT_PENDING_WORDS * 32 ||
+                        !(s->melt_pending[ti2 >> 5] & (1u << (ti2 & 31))))
+                        break;
+                    tx++;
+                }
+                int tx1 = tx - 1; /* inclusive run [tx0..tx1] on row ty */
+
+                /* L8 patch over the run (morton/Y-flip matches pool build:
+                 * gpu tile row = tiles_y-1-src_ty, fine row = morton_row[7-fy]) */
+                if (l8p) {
+                    int gty = (lty - 1) - ty;
+                    if (gty >= 0 && gty < lty) {
+                        for (int rtx = tx0; rtx <= tx1 && rtx < ltx; rtx++) {
+                            int stx = rtx * 8, sy0 = ty * 8;
+                            u8* dst = &l8p->indices[(gty * ltx + rtx) * 64];
+                            if (stx + 8 <= s->w && sy0 + 8 <= s->h) {
+                                for (int fy = 0; fy < 8; fy++) {
+                                    const u8* srow = px8 + (sy0 + fy) * s->w + stx;
+                                    const u8* m = morton_row[7 - fy];
+                                    dst[m[0]] = srow[0]; dst[m[1]] = srow[1];
+                                    dst[m[2]] = srow[2]; dst[m[3]] = srow[3];
+                                    dst[m[4]] = srow[4]; dst[m[5]] = srow[5];
+                                    dst[m[6]] = srow[6]; dst[m[7]] = srow[7];
+                                }
+                            } else {
+                                for (int fy = 0; fy < 8; fy++) {
+                                    int sy = sy0 + fy;
+                                    const u8* m = morton_row[7 - fy];
+                                    for (int fx = 0; fx < 8; fx++) {
+                                        int sx = stx + fx;
+                                        dst[m[fx]] = (sx < s->w && sy < s->h)
+                                                         ? px8[sy * s->w + sx] : 0;
+                                    }
                                 }
                             }
                         }
                     }
                 }
+
+                /* Patch each recent variant over the run rect. */
+                for (int i = 0; i < en; i++) {
+                    cache_update_entry_region(ents[i], tx0 * 8, ty * 8,
+                                              (tx1 - tx0 + 1) * 8, 8);
+                    dbg_regionupd_patched++;
+                }
             }
         }
+
+        memset(s->melt_pending, 0, sizeof(s->melt_pending));
     }
 
-    /* This function runs once per melted tile — hundreds of times in a
-     * heavy animation frame — so the work here lands directly in the
-     * MELTSPIKE stutter budget. Two hot-path cuts, both measured off the
-     * user's stutter session:
-     *
-     * 1. MEMO the entry list: melts stream many tiles of ONE sheet
-     *    back-to-back, but each notify was re-scanning all CACHE_MAX(512)
-     *    entries. Memo the per-texture entry list for (idx, frame); every
-     *    memo'd pointer is re-verified before use, so a stale memo is
-     *    harmless (an entry recycled mid-frame just fails the check; a
-     *    BRAND-NEW entry created mid-frame was built from the
-     *    already-melted source, so it doesn't need the patch).
-     *
-     * 2. Patch only variants BOUND RECENTLY (last 2 frames) or pinned. A
-     *    melting sheet averaged ~5 live cache entries (palette variants),
-     *    and every variant got the full morton rewrite for every tile even
-     *    though only the bound one is drawn. Stale variants are lazily
-     *    invalidated instead: they full-rebuild IF ever bound again
-     *    (atlas: version flip since its find path ignores `dirty`;
-     *    pool: dirty flag). Actively-flashing palettes alternate binds
-     *    within 1-2 frames, so both live variants still get patched —
-     *    no visual change. */
-    static int memo_idx = -1;
-    static u32 memo_frame = 0xFFFFFFFFu;
-    static CacheEntry* memo_e[12];
-    static int memo_n = 0;
-    static bool memo_overflow = false;
-
-    if (idx != memo_idx || frame_number != memo_frame) {
-        memo_idx = idx;
-        memo_frame = frame_number;
-        memo_n = 0;
-        memo_overflow = false;
-        for (int i = 0; i < CACHE_MAX; i++) {
-            CacheEntry* e = &gpu_cache[i];
-            if (!e->allocated || e->pending_delete) continue;
-            if (e->texture_index != idx) continue;
-            if (memo_n >= 12) { memo_overflow = true; break; }
-            memo_e[memo_n++] = e;
-        }
-    }
-
-    if (memo_overflow) {
-        /* >12 live variants (never observed; ~5 typical) — correctness
-         * first: patch everything via the full scan. */
-        for (int i = 0; i < CACHE_MAX; i++) {
-            CacheEntry* e = &gpu_cache[i];
-            if (!e->allocated || e->pending_delete) continue;
-            if (e->texture_index != idx) continue;
-            cache_update_entry_region(e, x, y, w, h);
-            dbg_regionupd_patched++;
-        }
-        return;
-    }
-
-    for (int i = 0; i < memo_n; i++) {
-        CacheEntry* e = memo_e[i];
-        if (!e->allocated || e->pending_delete || e->texture_index != idx)
-            continue; /* memo gone stale — skip safely */
-        if (e->pinned || e->last_used_frame + 10 >= frame_number) {
-            /* 10-frame window: cyclically-bound variants (palette flashes,
-             * alternating fx) stay hot-patched; a 2-frame window pushed them
-             * into repeated 6.8ms full rebuilds (measured). */
-            cache_update_entry_region(e, x, y, w, h);
-            dbg_regionupd_patched++;
-        } else if (e->atlas_cell >= 0) {
-            /* force rebuild on next bind — idempotent across repeated
-             * notifies (XOR of the CURRENT version, not of e's) */
-            e->tex_version = texture_versions[idx] ^ 0x80000000u;
-            atlas_l8_valid[e->atlas_cell] = false;
-        } else {
-            e->dirty = true; /* pool find path honors dirty */
-        }
-    }
+    melt_queue_n = 0;
+    melt_queue_overflow = false;
 }
 
 void SDLGameRenderer_PinTexture(unsigned int th) {
