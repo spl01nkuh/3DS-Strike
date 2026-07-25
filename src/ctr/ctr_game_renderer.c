@@ -342,6 +342,31 @@ typedef struct {
 static SrcTexture src_textures[FL_TEXTURE_MAX];
 static SrcPalette src_palettes[FL_PALETTE_MAX];
 
+/* L8 index cache (see the "L8 Index Cache" section further down for the
+ * implementation) — type + prototypes up here because atlas_build_cell's
+ * cross-variant fast path needs them. */
+#define L8_CACHE_MAX 64 /* was 24/32/48 — char select cycles 10+ sheets per
+                         * hovered character through this cache, and every
+                         * miss turns a ~2ms fast re-resolve into a 6.7ms full
+                         * rebuild during the super-art preview (measured:
+                         * sequential ti=8..14 rebuild bursts at select).
+                         * 48→64: atlas cell builds now share this cache for
+                         * cross-variant resolves (EX/super flash first binds),
+                         * adding the char sheets to its working set. */
+typedef struct {
+    int texture_index;   // which source texture this caches
+    u32 tex_version;     // version when indices were captured
+    int pot_w, pot_h;    // texture dimensions
+    u8* indices;         // morton-tiled index buffer (pot_w * pot_h bytes)
+    u32 last_used;       // frame number for LRU eviction
+    bool valid;
+} L8CacheEntry;
+static L8CacheEntry* l8_cache_find(int tex_idx, u32 tex_ver);
+static L8CacheEntry* l8_cache_alloc(int tex_idx, u32 tex_ver, int pot_w, int pot_h);
+static void l8_resolve_palette(const L8CacheEntry* l8, const texel_t* palette,
+                                texel_t* tex_data, int tiles_x, int tiles_y,
+                                int dst_tiles_x, int dst_base_tx);
+
 // Version counters — incremented on every Create/Unlock
 u32 texture_versions[FL_TEXTURE_MAX];
 static u32 palette_versions[FL_PALETTE_MAX];
@@ -821,6 +846,37 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
         u8* l8 = atlas_l8[cell];
         int cell_tiles_x = ATLAS_CELL_SIZE >> 3;
 
+        /* CROSS-VARIANT fast path: the texture-keyed L8 cache (shared with
+         * the pool path) lets a NEW palette variant of an already-decoded
+         * full-size sheet resolve straight from cached indices instead of a
+         * full source decode. This is every EX/super-flash first bind
+         * (measured 6.8ms each, several stacked at flash onset — the
+         * remaining "EX moves come out slow"). Restricted to 256x256: only
+         * there do the pool and atlas index layouts coincide (same Y-flip
+         * base, same 32-tile stride). Bit-identical to the full build. */
+        int shared_tex_idx = (int)(src - src_textures);
+        if (pot_w == ATLAS_CELL_SIZE && pot_h == ATLAS_CELL_SIZE &&
+            shared_tex_idx >= 0 && shared_tex_idx < FL_TEXTURE_MAX) {
+            u32 tv = texture_versions[shared_tex_idx];
+            L8CacheEntry* l8s = l8_cache_find(shared_tex_idx, tv);
+            if (l8s && l8s->pot_w == (int)pot_w && l8s->pot_h == (int)pot_h) {
+                l8_resolve_palette(l8s, pal_colors, strip_data,
+                                   cell_tiles_x, cell_tiles_x,
+                                   strip_tiles_x, cell_base_tx);
+                if (l8) {
+                    memcpy(l8, l8s->indices,
+                           (size_t)cell_tiles_x * cell_tiles_x * 64);
+                    atlas_l8_valid[cell] = true;
+                } else {
+                    atlas_l8_valid[cell] = false;
+                }
+                atlas_mark_strip_dirty(strip);
+                atlas_builds_total++;
+                atlas_builds_period++;
+                return;
+            }
+        }
+
         for (int src_y = 0; src_y < h; src_y++) {
             const u8* src_row = px + src_y * src->w;
             /* Y-flip within the CELL height, not pot_h: the GPU's v axis
@@ -859,6 +915,19 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
             }
         }
         atlas_l8_valid[cell] = (l8 != NULL);
+
+        /* Publish this full build's indices into the shared texture-keyed L8
+         * cache (one 64KB copy) so the sheet's NEXT palette variant — pool OR
+         * atlas — takes the fast resolve above instead of another full build. */
+        if (l8 && pot_w == ATLAS_CELL_SIZE && pot_h == ATLAS_CELL_SIZE &&
+            shared_tex_idx >= 0 && shared_tex_idx < FL_TEXTURE_MAX) {
+            L8CacheEntry* l8_pub = l8_cache_alloc(shared_tex_idx,
+                                                  texture_versions[shared_tex_idx],
+                                                  (int)pot_w, (int)pot_h);
+            if (l8_pub)
+                memcpy(l8_pub->indices, l8,
+                       (size_t)cell_tiles_x * cell_tiles_x * 64);
+        }
     } else {
         int pot_tiles_x = (int)(pot_w >> 3);
         /* Same cell-height flip as the fast path: content occupies the TOP
@@ -1006,21 +1075,9 @@ u32 dbg_settex_miss(void); u32 dbg_settex_create(void); u32 dbg_settex_fail(void
 // ---------------------------------------------------------------------------
 // L8 Index Cache: caches morton-tiled 8-bit palette indices per texture page.
 // When ONLY the palette changes, re-resolve from cached indices (skip LZ decompress).
+// (L8CacheEntry type + prototypes declared near the top — atlas_build_cell's
+// cross-variant fast path uses them before this point in the file.)
 // ---------------------------------------------------------------------------
-
-#define L8_CACHE_MAX 48 /* was 24, then 32 — char select cycles 10+ sheets per
-                         * hovered character through this cache, and every
-                         * miss turns a ~2ms fast re-resolve into a 6.7ms full
-                         * rebuild during the super-art preview (measured:
-                         * sequential ti=8..14 rebuild bursts at select) */
-typedef struct {
-    int texture_index;   // which source texture this caches
-    u32 tex_version;     // version when indices were captured
-    int pot_w, pot_h;    // texture dimensions
-    u8* indices;         // morton-tiled index buffer (pot_w * pot_h bytes)
-    u32 last_used;       // frame number for LRU eviction
-    bool valid;
-} L8CacheEntry;
 
 static L8CacheEntry l8_cache[L8_CACHE_MAX];
 static u32 l8_hits = 0, l8_misses = 0;
