@@ -143,7 +143,12 @@ typedef struct {
     s32 palo;      /* cx mode: the player's color code (wk->colcd) */
     u32 next_cg;
     u32 decoded;   /* wrap guard: stop if we decode more than capacity */
-    u8 state;      /* 0=free 1=running 2=done */
+    u16 palts[8];  /* distinct DRAW palettes this group's chips bind (from
+                      trsptr->attr) — feeds the renderer pre-build pass */
+    u8 palt_n;
+    u8 rp_page;    /* renderer-pass cursors (state 3), resume across frames */
+    u8 rp_palt;
+    u8 state;      /* 0=free 1=decoding 2=done 3=renderer pre-build pass */
     u8 cx;         /* 0 = indexed tiles (lz_ext_p6_fx, palt 0)
                       1 = palette-BAKED 16-bit tiles (lz_ext_p6_cx with
                           ColorRAM[(attr&0x1FF)+palo], upload size<<1) —
@@ -176,10 +181,13 @@ void mlt_prewarm_boost(u32 frames) {
  * have been evicted since; already-cached tiles skip instantly). */
 void mlt_prewarm_restart(void) {
     for (int i = 0; i < PREWARM_JOBS_MAX; i++) {
-        if (prewarm_jobs[i].state == 2) {
+        if (prewarm_jobs[i].state >= 2) {
             prewarm_jobs[i].state = 1;
             prewarm_jobs[i].next_cg = 0;
             prewarm_jobs[i].decoded = 0;
+            prewarm_jobs[i].palt_n = 0; /* fresh collection on re-walk */
+            prewarm_jobs[i].rp_page = 0;
+            prewarm_jobs[i].rp_palt = 0;
         }
     }
 }
@@ -202,6 +210,9 @@ static void prewarm_register_mode(MultiTexture* mt, s32 group, u8 cx, s32 palo) 
     prewarm_jobs[free_i].cx = cx;
     prewarm_jobs[free_i].next_cg = 0;
     prewarm_jobs[free_i].decoded = 0;
+    prewarm_jobs[free_i].palt_n = 0;
+    prewarm_jobs[free_i].rp_page = 0;
+    prewarm_jobs[free_i].rp_palt = 0;
     prewarm_jobs[free_i].state = 1;
 }
 
@@ -297,6 +308,44 @@ static s32 prewarm_slot32(MultiTexture* mt, u32 code, u32 palt) {
     return -2; /* no free slot — see prewarm_slot16 */
 }
 
+/* State-3 renderer pre-build pass — the CAPCOM-logo treatment generalized
+ * (user plan: "prepare every stage and character animation at the VS
+ * screen"). After a job finishes decoding tiles, pre-BUILD the renderer's
+ * (sheet, palette) cache entries the fight will bind: every group page ×
+ * every draw-palt collected from the group's own animation tables. First-use
+ * moves (EX/super flash palettes included, when referenced by the tables)
+ * then bind only cached entries. Budgeted; cursors resume across frames.
+ * Returns 1 when the job's pass is complete. */
+static int prewarm_job_renderer_pass(PrewarmJob* job, u64 t0, u64 budget) {
+    extern void SDLGameRenderer_PrewarmTexture(unsigned int th);
+    MultiTexture* mt = job->mt;
+    u32 pages16 = (u32)(mt->mltnum16 >> 8);
+    u32 pages32 = (u32)(mt->mltnum32 >> 6);
+    u32 total = pages16 + pages32;
+
+    while (job->rp_page < total) {
+        u32 gixpage = (job->rp_page < pages16)
+                          ? (u32)(mt->mltgidx16 + job->rp_page)
+                          : (u32)(mt->mltgidx32 + (job->rp_page - pages16));
+        u32 texh = (u32)ppgGetUsingTextureHandle(NULL, (s32)gixpage);
+        if (!texh) {
+            job->rp_page++;
+            job->rp_palt = 0;
+            continue;
+        }
+        while (job->rp_palt < job->palt_n) {
+            u32 palh = (u32)ppgGetUsingPaletteHandle(NULL, (s32)job->palts[job->rp_palt]);
+            SDLGameRenderer_PrewarmTexture(texh | (palh << 16));
+            job->rp_palt++;
+            if (svcGetSystemTick() - t0 > budget)
+                return 0; /* out of budget — resume next frame */
+        }
+        job->rp_page++;
+        job->rp_palt = 0;
+    }
+    return 1;
+}
+
 void mlt_prewarm_tick(void) {
     /* NOT during character select: the hovered character's super-art preview
      * animates from the very sheets the prewarm would be writing — the
@@ -339,9 +388,20 @@ void mlt_prewarm_tick(void) {
     for (int pass = 0; pass < 2; pass++) {
     for (int j = 0; j < PREWARM_JOBS_MAX; j++) {
         PrewarmJob* job = &prewarm_jobs[j];
-        if (job->state != 1) continue;
+        if (job->state != 1 && job->state != 3) continue;
         if (pass == 0 && !job->cx) continue; /* cx first */
         if (pass == 1 && job->cx) continue;
+        if (job->state == 3) {
+            /* Renderer pre-build pass: needs the group's data list current
+             * (same contract as the decode uploads below). */
+            ppgSetCurrentDataListPtr((void*)&job->mt->texList);
+            if (prewarm_job_renderer_pass(job, t0, budget)) {
+                job->state = 2;
+                continue;
+            }
+            ppgSetCurrentDataListPtr(saved_dlist);
+            return; /* budget out — resume next frame */
+        }
         if (!job->cx) {
             int has_cx_twin = 0;
             for (int k = 0; k < PREWARM_JOBS_MAX; k++) {
@@ -398,6 +458,19 @@ void mlt_prewarm_tick(void) {
                         palt = (u32)((trsptr->attr & 0x1FF) + job->palo);
                         if (palt >= 512) continue; /* ColorRAM bound */
                     }
+                    /* Collect the DRAW palette this chip binds (fx draws pass
+                     * attr&0x1FF per quad; cx sheets are palette-baked and
+                     * bind handle 0) — feeds the state-3 renderer pre-build
+                     * pass (the "CAPCOM logo treatment" for fights/stages). */
+                    {
+                        u16 dp = job->cx ? 0 : (u16)(trsptr->attr & 0x1FF);
+                        if (job->palt_n < 8) {
+                            int pk;
+                            for (pk = 0; pk < job->palt_n; pk++)
+                                if (job->palts[pk] == dp) break;
+                            if (pk == job->palt_n) job->palts[job->palt_n++] = dp;
+                        }
+                    }
                     s32 slot = -1;
                     if (wh == 1 || wh == 2) {
                         slot = mt->ext ? prewarm_slot16(mt, cc.code, palt)
@@ -443,16 +516,16 @@ void mlt_prewarm_tick(void) {
                     }
                 }
             }
-            if (cache_full) { job->state = 2; break; } /* opportunistic only */
+            if (cache_full) { job->state = 3; break; } /* opportunistic only; renderer pass next */
             job->next_cg++;
 
-            if (job->decoded > cap) { job->state = 2; break; } /* wrapped capacity */
+            if (job->decoded > cap) { job->state = 3; break; } /* wrapped capacity; renderer pass next */
             if (svcGetSystemTick() - t0 > budget) {
                 ppgSetCurrentDataListPtr(saved_dlist);
                 return; /* resume next frame */
             }
         }
-        if (job->next_cg >= sizeof(obj_group_table)) job->state = 2;
+        if (job->next_cg >= sizeof(obj_group_table)) job->state = 3; /* decode done; renderer pass next */
     }
     } /* pass loop */
     ppgSetCurrentDataListPtr(saved_dlist);
