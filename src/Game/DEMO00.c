@@ -219,6 +219,25 @@ void CAPLOGO_Init() {
     ppgSetupTexChunk_3rd(NULL, 600, 1);
     Push_ramcnt_key(key);
     ppgSourceDataReleased(0);
+
+    /* 3DS: the fade in CAPLOGO_Move steps the palette bank every 2nd frame
+     * (op_timer0/2 → banks 0..30, then 31 held) — each bank is a FIRST-EVER
+     * (texture, palette) pair for the renderer, i.e. a synchronous sheet
+     * build in the middle of the fade, every other frame, for the whole
+     * fade. No cache/copy optimization can hide a first build; the fix is
+     * to pre-build all fade variants HERE, behind the scene load, so the
+     * fade only ever binds cached entries. */
+    {
+        extern void SDLGameRenderer_PrewarmTexture(unsigned int th);
+        u32 texh = (u32)ppgGetUsingTextureHandle(NULL, 600);
+        if (texh) {
+            s32 bank;
+            for (bank = 0; bank <= 31; bank++) {
+                u32 palh = (u32)ppgGetUsingPaletteHandle(NULL, bank);
+                SDLGameRenderer_PrewarmTexture(texh | (palh << 16));
+            }
+        }
+    }
 }
 
 s16 CAPLOGO_Move(u16 type) {
