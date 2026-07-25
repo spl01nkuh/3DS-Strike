@@ -99,6 +99,18 @@ s32 Setup_Directory_Record_Data() {
                      "(then relaunch -- press START to exit)");
     }
 
+    /* 3DS: blocking pre-logo load — hold "PREPARE TO STRIKE" until the AFS
+     * preloader finishes, so the CAPCOM logo starts with a quiet disk. Once
+     * per boot (afsInit is idempotent; re-entries keep the warm cache). */
+    {
+        extern void bootLoadingScreen(void);
+        static u8 boot_load_done = 0;
+        if (!boot_load_done) {
+            boot_load_done = 1;
+            bootLoadingScreen();
+        }
+    }
+
     /*
     DskDrvErrBe = 0;
     DskDrvErrType = 0xFFFF;

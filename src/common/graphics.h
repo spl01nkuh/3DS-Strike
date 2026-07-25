@@ -55,6 +55,7 @@ extern int RTT_Enabled;
  * fatalMessage holds a readable error instead of a silent hang and exits to the
  * Homebrew Launcher on START/HOME. */
 void showLoadingMessage(const char *msg);
+void bootLoadingScreen(void); /* blocking pre-logo AFS preload (graphics.c) */
 void fatalMessage(const char *msg);
 
 // functions

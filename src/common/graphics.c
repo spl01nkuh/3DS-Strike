@@ -385,6 +385,26 @@ void showLoadingMessage(const char *msg) {
     draw_message_frame(msg);
 }
 
+/* Blocking boot loading screen (user plan, point 1 — hard version): hold a
+ * black "PREPARE TO STRIKE" screen until the AFS boot preloader has pulled
+ * every known one-shot monster file into the read cache, so the CAPCOM logo
+ * and the rest of the boot flow run with a quiet disk. Called right after
+ * afsInit at boot (GD3rd.c Setup_Directory_Record_Data). The 45s cap is a
+ * safety net for a dead/slow SD — the game proceeds regardless. */
+void bootLoadingScreen(void) {
+    extern s32 afsPreloadDone(void);
+    extern void afsPreloadPump(void);
+    u64 start = svcGetSystemTick();
+
+    while (!afsPreloadDone()) {
+        showLoadingMessage("PREPARE TO STRIKE");
+        afsPreloadPump();
+        svcSleepThread(2 * 1000 * 1000LL); /* 2ms — let the I/O thread run */
+        if ((svcGetSystemTick() - start) > (u64)45 * SYSCLOCK_ARM11)
+            break;
+    }
+}
+
 void fatalMessage(const char *msg) {
     /* A readable error beats a silent black-screen hang (the old while(1)).
      * Keep aptMainLoop running so HOME works; START exits to the launcher. */
