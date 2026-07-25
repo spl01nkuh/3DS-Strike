@@ -308,11 +308,15 @@ void mlt_prewarm_tick(void) {
 
     /* ~1.5ms budget per frame normally; ~5ms inside a post-transition
      * loading window (VS card, round intro, fades — scenes with slack),
-     * so whole charsets finish before gameplay. */
+     * so whole charsets finish before gameplay. Boot demos (G_No[0]==0:
+     * warning/CAPCOM logo) are EXCLUDED from the boost — the blocking
+     * PREPARE TO STRIKE screen already frontloads everything, and a 5ms
+     * decode budget during the logo was costing it its 60fps. */
     u64 budget = (u64)(0.0015 * 268111856.0);
     if (prewarm_boost_frames) {
         prewarm_boost_frames--;
-        budget = (u64)(0.005 * 268111856.0);
+        if (G_No[0] != 0)
+            budget = (u64)(0.005 * 268111856.0);
     }
     u64 t0 = svcGetSystemTick();
 
