@@ -2096,21 +2096,23 @@ s32 seqsStoreChip(f32 x, f32 y, s32 w, s32 h, s32 gix, s32 code, s32 attr, s32 a
     /* Native renderer expects NORMALIZED [0,1] texture coordinates (its
      * atlas/pool UV remap multiplies by src_w/strip_w) — the old PSP
      * pipeline consumed raw texel coords here. Divide by the 256px sheet
-     * size, matching the reference tree's seqsStoreChip. */
+     * size, matching the reference tree's seqsStoreChip. Written as multiply
+     * by the exact reciprocal: bit-identical for power-of-two divisors, and
+     * ARM11 fdiv costs ~30 cycles in this runs-per-chip path. */
     if (attr & 0x8000) {
-        chip->t[1].s = u / 256.0f;
-        chip->t[0].s = (u + w) / 256.0f;
+        chip->t[1].s = u * (1.0f / 256.0f);
+        chip->t[0].s = (u + w) * (1.0f / 256.0f);
     } else {
-        chip->t[0].s = u / 256.0f;
-        chip->t[1].s = (u + w) / 256.0f;
+        chip->t[0].s = u * (1.0f / 256.0f);
+        chip->t[1].s = (u + w) * (1.0f / 256.0f);
     }
 
     if (attr & 0x4000) {
-        chip->t[1].t = v / 256.0f;
-        chip->t[0].t = (v + h) / 256.0f;
+        chip->t[1].t = v * (1.0f / 256.0f);
+        chip->t[0].t = (v + h) * (1.0f / 256.0f);
     } else {
-        chip->t[0].t = v / 256.0f;
-        chip->t[1].t = (v + h) / 256.0f;
+        chip->t[0].t = v * (1.0f / 256.0f);
+        chip->t[1].t = (v + h) * (1.0f / 256.0f);
     }
 
     chip->tex_code |= ppgGetUsingPaletteHandle(NULL, attr & 0x1FF) << 16;

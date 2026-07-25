@@ -1165,10 +1165,10 @@ void ppgCalScrPosition(s32 x, s32 y, s32 xs, s32 ys) {
      * so (x&0x7F)>>7 == 0), collapsing the backdrop tiles' UVs — missing or
      * quantized-jumping stage backdrops, char-select and score backgrounds.
      * Divide by the 128px chip size instead, matching the reference tree. */
-    scrDrawPos[0].u = (f32)(x & 0x7F) / 128.0f;
-    scrDrawPos[0].v = (f32)(y & 0x7F) / 128.0f;
-    scrDrawPos[3].u = (f32)((x & 0x7F) + xs) / 128.0f;
-    scrDrawPos[3].v = (f32)((y & 0x7F) + ys) / 128.0f;
+    scrDrawPos[0].u = (f32)(x & 0x7F) * (1.0f / 128.0f);
+    scrDrawPos[0].v = (f32)(y & 0x7F) * (1.0f / 128.0f);
+    scrDrawPos[3].u = (f32)((x & 0x7F) + xs) * (1.0f / 128.0f);
+    scrDrawPos[3].v = (f32)((y & 0x7F) + ys) * (1.0f / 128.0f);
     scrDrawPos[1].u = scrDrawPos[3].u;
     scrDrawPos[2].u = scrDrawPos[0].u;
     scrDrawPos[1].v = scrDrawPos[0].v;

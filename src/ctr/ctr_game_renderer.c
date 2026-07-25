@@ -99,6 +99,54 @@ static texel_t color16_direct_to_rgba(u16 p) {
     return pack_rgba(r, g, b, a ? 255 : 0);
 }
 
+/* Direct GU_PSM_4444 textures — R nibble LOW (PS2 order: R 3:0, G 7:4,
+ * B 11:8, A 15:12), the OPPOSITE end from 5551-direct; any nonzero alpha
+ * nibble = opaque. Matches the old renderer's proven conv4444 (gu_draw.c).
+ * These were collapsed into SCE_GS_PSMCT16 and decoded with the 5551 layout
+ * — same channel-scramble class as the title-logo bug. */
+static texel_t color16_4444_to_rgba(u16 p) {
+    p = (u16)((p >> 8) | (p << 8)); /* endian switch, as with the 5551 logo fix */
+    u8 r = (u8)(( p        & 0xF) * 255 / 15);
+    u8 g = (u8)(((p >>  4) & 0xF) * 255 / 15);
+    u8 b = (u8)(((p >>  8) & 0xF) * 255 / 15);
+    u8 a = ((p >> 12) & 0xF) ? 255 : 0;
+    return pack_rgba(r, g, b, a);
+}
+
+/* Local format tag for GU_PSM_4444 — PS2 GS has no 4444 format, so reusing
+ * SCE_GS_PSMCT16 lost the layout distinction at the translation boundary. */
+#define GSFMT_DIRECT_4444 0x4444
+
+/* Value LUTs for direct 16-bit formats (the old gu_draw.c trick): the
+ * conversion is a pure function of the pixel value, so a lazily-built
+ * 64Ki-entry table turns per-texel bit math + function call into one load.
+ * 128KB each, malloc'd on first use only (title logo etc. — measured 56ms
+ * for one 512x256 build through the per-texel path). */
+static texel_t* lut16_direct_5551;
+static texel_t* lut16_direct_4444;
+
+static const texel_t* lut16_direct_get(u32 fmt) {
+    if (fmt == SCE_GS_PSMCT16) {
+        if (!lut16_direct_5551) {
+            lut16_direct_5551 = (texel_t*)malloc(65536 * sizeof(texel_t));
+            if (lut16_direct_5551)
+                for (u32 v = 0; v < 65536; v++)
+                    lut16_direct_5551[v] = color16_direct_to_rgba((u16)v);
+        }
+        return lut16_direct_5551;
+    }
+    if (fmt == GSFMT_DIRECT_4444) {
+        if (!lut16_direct_4444) {
+            lut16_direct_4444 = (texel_t*)malloc(65536 * sizeof(texel_t));
+            if (lut16_direct_4444)
+                for (u32 v = 0; v < 65536; v++)
+                    lut16_direct_4444[v] = color16_4444_to_rgba((u16)v);
+        }
+        return lut16_direct_4444;
+    }
+    return NULL;
+}
+
 // Convert PS2 32-bit color (BGRA8888 in memory) to GPU_RGBA4
 static texel_t color32_to_rgba(u32 p) {
     u8 r = (u8)((p >> 16) & 0xFF);
@@ -222,7 +270,7 @@ static u32 gu_to_gs_format(u32 f) {
     case 5: return SCE_GS_PSMT8;   /* GU_PSM_T8 */
     case 4: return SCE_GS_PSMT4;   /* GU_PSM_T4 */
     case 1: return SCE_GS_PSMCT16; /* GU_PSM_5551 */
-    case 2: return SCE_GS_PSMCT16; /* GU_PSM_4444 (16-bit direct; bit layout differs — rare) */
+    case 2: return GSFMT_DIRECT_4444; /* GU_PSM_4444 — distinct tag; layout differs from 5551 */
     case 3: return SCE_GS_PSMCT32; /* GU_PSM_8888 */
     default: return f;
     }
@@ -235,6 +283,7 @@ static size_t texture_byte_size_for_format(int w, int h, int fmt) {
     case SCE_GS_PSMT4:
         return ((size_t)w * (size_t)h) >> 1;
     case SCE_GS_PSMCT16:
+    case GSFMT_DIRECT_4444:
         return (size_t)w * (size_t)h * sizeof(u16);
     default:
         return 0;
@@ -281,6 +330,7 @@ static void melt_flush_pending(void); /* defined after UpdateTextureRegion */
 static int melt_queue[64];
 static int melt_queue_n;
 static bool melt_queue_overflow;
+
 
 typedef struct {
     int count;
@@ -1297,6 +1347,10 @@ static texel_t resolve_texel(const SrcTexture* src, const SrcPalette* pal, int x
         u16 raw = ((const u16*)px)[y * src->w + x];
         return color16_direct_to_rgba(raw);
     }
+    case GSFMT_DIRECT_4444: {
+        u16 raw = ((const u16*)px)[y * src->w + x];
+        return color16_4444_to_rgba(raw);
+    }
     default:
         return 0;
     }
@@ -1852,14 +1906,14 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
                     }
 #endif
                     const u8* s = src_row + tx * 8;
-                    tile_dst[m[0]] = pal_colors[s[0]];
-                    tile_dst[m[1]] = pal_colors[s[1]];
-                    tile_dst[m[2]] = pal_colors[s[2]];
-                    tile_dst[m[3]] = pal_colors[s[3]];
-                    tile_dst[m[4]] = pal_colors[s[4]];
-                    tile_dst[m[5]] = pal_colors[s[5]];
-                    tile_dst[m[6]] = pal_colors[s[6]];
-                    tile_dst[m[7]] = pal_colors[s[7]];
+                    /* Morton x-pairs are always adjacent (bit0 = x&1), so
+                     * write two texels per u32 store — bit-identical output,
+                     * same trick as atlas_palette_resolve. This loop is the
+                     * measured 6.8ms full-sheet build cost. */
+                    *(u32*)&tile_dst[m[0]] = (u32)pal_colors[s[0]] | ((u32)pal_colors[s[1]] << 16);
+                    *(u32*)&tile_dst[m[2]] = (u32)pal_colors[s[2]] | ((u32)pal_colors[s[3]] << 16);
+                    *(u32*)&tile_dst[m[4]] = (u32)pal_colors[s[4]] | ((u32)pal_colors[s[5]] << 16);
+                    *(u32*)&tile_dst[m[6]] = (u32)pal_colors[s[6]] | ((u32)pal_colors[s[7]] << 16);
                     if (l8_new) {
                         u8* idx_dst = &l8_new->indices[(row_base + tx) * 64];
                         idx_dst[m[0]] = s[0]; idx_dst[m[1]] = s[1];
@@ -1877,12 +1931,34 @@ l8_done:
     } else {
         // General path for PSMT4/PSMCT16/other
         pool_clear_slot(&texture_pool[slot_idx]);
+        /* Direct 16-bit sheets: LUT fast path for fully-interior tiles.
+         * The per-texel resolve_texel route (bounds check + fmt switch +
+         * bit-math per texel) measured 56ms for one 512x256 title-logo
+         * build — 3+ dropped frames from a single bind. */
+        const texel_t* lut16 = NULL;
+        const u16* px16 = NULL;
+        if ((src->fmt == SCE_GS_PSMCT16 || src->fmt == GSFMT_DIRECT_4444) && src->pixels) {
+            lut16 = lut16_direct_get(src->fmt);
+            px16 = (const u16*)src->pixels;
+        }
         for (int ty = 0; ty < tiles_y; ty++) {
             for (int tx = 0; tx < tiles_x; tx++) {
                 int src_tile_x = tx * 8;
                 int src_tile_y = (int)pot_h - 8 - ty * 8;
                 int tile_idx = ty * dst_tiles_x + dst_base_tx + tx;
                 texel_t* tile_dst = TILE_AT(tex_data, tile_idx);
+                if (lut16 && src_tile_x + 8 <= src->w &&
+                    src_tile_y >= 0 && src_tile_y + 8 <= src->h) {
+                    for (int fy = 0; fy < 8; fy++) {
+                        const u16* srow = px16 + (size_t)(src_tile_y + fy) * src->w + src_tile_x;
+                        const u8* m = morton_lut[7 - fy];
+                        *(u32*)&tile_dst[m[0]] = (u32)lut16[srow[0]] | ((u32)lut16[srow[1]] << 16);
+                        *(u32*)&tile_dst[m[2]] = (u32)lut16[srow[2]] | ((u32)lut16[srow[3]] << 16);
+                        *(u32*)&tile_dst[m[4]] = (u32)lut16[srow[4]] | ((u32)lut16[srow[5]] << 16);
+                        *(u32*)&tile_dst[m[6]] = (u32)lut16[srow[6]] | ((u32)lut16[srow[7]] << 16);
+                    }
+                    continue;
+                }
                 for (int fy = 0; fy < 8; fy++) {
                     int sy = src_tile_y + fy;
                     int dy_fine = 7 - fy;
@@ -2139,6 +2215,37 @@ void SDLGameRenderer_DirectTileUpload(unsigned int tex_handle, int pal_handle,
     if (tex_idx < 0 || tex_idx >= FL_TEXTURE_MAX) return;
 
     int pal_idx = pal_handle > 0 ? pal_handle - 1 : -1;
+
+    /* ★ Mirror-to-source + standard region notify. The old body below wrote
+     * decoded texels into ONE (texture, palette) cache entry's GPU pixels and
+     * nowhere else. Two measured failure modes (Ibuki-stage sky dashes,
+     * super-KO artifacts — pre-existing, reproduced without any of today's
+     * changes):
+     *   1. the CPU-side source buffer never received the tiles, so every
+     *      rebuild / palette re-resolve / melt patch reverted them to stale
+     *      garbage (palette-cycling stages rebuild constantly);
+     *   2. the sheet's OTHER palette variants never got the tiles at all
+     *      (scene snapshot: the sky sheet draws through two palettes at once).
+     * Decoding into the source buffer and notifying the region-update path
+     * fixes both: the deferred melt flush patches every recent variant and
+     * the L8 caches from the now-correct source. Old body kept as fallback
+     * for sheets whose source buffer can't be mirrored. */
+    {
+        SrcTexture* s = &src_textures[tex_idx];
+        if (s->valid && s->pixels && s->fmt == SCE_GS_PSMT8 && s->w > 0 &&
+            pixel_x >= 0 && pixel_y >= 0 && tile_w <= 32 &&
+            pixel_x + tile_w <= s->w && pixel_y + tile_h <= s->h) {
+            u8* dst = (u8*)(uintptr_t)s->pixels;
+            for (int py = 0; py < tile_h; py++) {
+                u8* drow = dst + (size_t)(pixel_y + py) * s->w + pixel_x;
+                const s16* lrow = &dctex_linear[py << 5];
+                for (int px = 0; px < tile_w; px++)
+                    drow[px] = cps3_data[lrow[px]];
+            }
+            SDLGameRenderer_UpdateTextureRegion(tex_handle, pixel_x, pixel_y, tile_w, tile_h);
+            return;
+        }
+    }
 
     /* Find or create the GPU cache entry */
     CacheEntry* entry = cache_find(tex_idx, pal_idx);
@@ -2880,6 +2987,7 @@ void SDLGameRenderer_RenderFrame(void) {
      * don't carry stale GPU content into the next drawn frame. */
     melt_flush_pending();
 
+
     if (render_task_count == 0) return;
 
     // Flush atlas strips before GPU reads — builds/resolves/region updates
@@ -3616,24 +3724,33 @@ void SDLGameRenderer_UnlockTexture(unsigned int th) {
             s->is_placeholder = used_wkvram_fallback;
             u32 gsfmt = gu_to_gs_format(ft->format);
             size_t byte_size = texture_byte_size_for_format(ft->width, ft->height, gsfmt);
-            /* Sampled content checksum (~256 spread-out bytes, not a full
-             * 65KB hash): some game paths re-decode a sheet's pixels IN
-             * PLACE — same pointer, same dims — with no region-update
-             * notify (e.g. the char/stage-select background sheets on
-             * screen transitions). With no signal at all, cache entries
-             * keep serving the old capture: after the palette-churn
-             * invalidation was made lazy, this surfaced as stale/partial
-             * background art. A byte-identical sampled sum can in theory
-             * miss a change confined to unsampled bytes, but these
-             * re-decodes replace whole sheets; region-update paths remain
-             * the precise mechanism for partial writes. */
+            /* FULL content checksum. This was a ~256-byte SAMPLED sum, which
+             * missed in-place re-decodes whose delta fell between samples —
+             * measured: Ibuki-stage sky animation re-decodes only a few
+             * tiles per tick, so most updates went undetected → no version
+             * bump → stale GPU tiles (dashed sky corruption; same-class
+             * super-KO artifacts). Word-wise FNV over the whole sheet is
+             * ~32K u32 ops for a 128KB sheet — cheap next to the 6.8ms
+             * rebuild a detection triggers, and Unlocks are per re-decode,
+             * not per frame drawn. */
             u32 sum = 0;
-            if (pixels && byte_size) {
-                const u8* bp = (const u8*)pixels;
-                size_t stride = (byte_size > 4096) ? (byte_size / 256) : 16;
-                for (size_t off = 0; off < byte_size; off += stride)
-                    sum = sum * 33 + bp[off];
-                sum = sum * 33 + bp[byte_size - 1];
+            if (pixels && byte_size && !s->has_region_updates) {
+                /* Melt-notified sheets skip the hash entirely: the region
+                 * path signals their changes precisely (and resets checksum
+                 * to 0 anyway), so hashing 64-128KB per Unlock for them is
+                 * pure waste on the 268MHz target. */
+                if (((uintptr_t)pixels & 3) == 0) {
+                    const u32* wp = (const u32*)pixels;
+                    size_t nw = byte_size >> 2;
+                    for (size_t k = 0; k < nw; k++)
+                        sum = (sum ^ wp[k]) * 16777619u;
+                    for (size_t off = nw << 2; off < byte_size; off++)
+                        sum = (sum ^ ((const u8*)pixels)[off]) * 16777619u;
+                } else {
+                    const u8* bp = (const u8*)pixels;
+                    for (size_t off = 0; off < byte_size; off++)
+                        sum = (sum ^ bp[off]) * 16777619u;
+                }
                 if (!sum) sum = 1; /* keep 0 as "no checksum" sentinel */
             }
             /* checksum==0 means "unknown": fresh capture, or content since
@@ -3884,6 +4001,7 @@ static void melt_flush_pending(void) {
     melt_queue_n = 0;
     melt_queue_overflow = false;
 }
+
 
 void SDLGameRenderer_PinTexture(unsigned int th) {
     int tex_idx = LO_16_BITS(th) - 1;
