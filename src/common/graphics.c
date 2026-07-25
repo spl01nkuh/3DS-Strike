@@ -422,7 +422,12 @@ void initGu() {
     gfxInitDefault();
     gfxSet3D(false);
 
-    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE);
+    /* citro3d's stock default (0x40000). Heavy-VFX fight frames measured up
+     * to ~330 individual draw calls (no depth buffer -> strict z-order
+     * submission -> same-texture quads at different z can't batch); doubled
+     * to remove any chance of a mid-frame command-buffer-pressure stall
+     * under that load. Cheap (extra linear RAM), zero visual risk. */
+    C3D_Init(C3D_DEFAULT_CMDBUF_SIZE * 2);
     C2D_Init(C2D_DEFAULT_MAX_OBJECTS);
     C2D_Prepare();
 

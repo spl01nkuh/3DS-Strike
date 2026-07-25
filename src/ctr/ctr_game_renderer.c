@@ -3505,7 +3505,10 @@ frame_timing:;
 #endif /* SF3_PERF_LOG */
 }
 
+int g_last_frame_task_count = 0; /* ONE-SHOT frame probe (EX-move stutter hunt) */
+
 void SDLGameRenderer_EndFrame(void) {
+    g_last_frame_task_count = render_task_count;
     render_task_count = 0;
     cache_flush_pending();  // Actually free textures marked for deletion during this frame
     frame_number++;
