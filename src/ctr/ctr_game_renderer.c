@@ -542,9 +542,29 @@ static bool atlas_dirty = false;
  * re-resolves paid a full 512KB strip flush PER resolve, and the consumers
  * flushed per-CELL (4x redundant per strip). */
 static u8 atlas_strip_flush_pending = 0;
-static inline void atlas_mark_strip_dirty(int strip) {
+/* Dirty TILE-ROW range per strip: tile rows are contiguous in the linear
+ * texture buffer, so region-granular writes (melt patches) can flush just
+ * their row band instead of the whole 512KB strip — full-strip flushes per
+ * melted sheet per frame were the remaining per-frame upload cost on
+ * streaming scenes (CAPCOM logo / montage). Full-content writers (cell
+ * builds span every row of a single-row strip) keep whole-strip semantics. */
+#define STRIP_ROWS_EMPTY_Y0 255
+static u8 atlas_strip_dirty_y0[8] = { 255, 255, 255, 255, 255, 255, 255, 255 };
+static u8 atlas_strip_dirty_y1[8];
+#define POOL_STRIP_TRACK_MAX 64
+static u8 pool_strip_dirty_y0[POOL_STRIP_TRACK_MAX];
+static u8 pool_strip_dirty_y1[POOL_STRIP_TRACK_MAX];
+
+static inline void atlas_mark_strip_dirty_rows(int strip, int ty0, int ty1) {
     atlas_strip_flush_pending |= (u8)(1u << strip);
     atlas_dirty = true;
+    if (ty0 < 0) ty0 = 0;
+    if (ty1 > 254) ty1 = 254;
+    if (ty0 < atlas_strip_dirty_y0[strip]) atlas_strip_dirty_y0[strip] = (u8)ty0;
+    if (ty1 > atlas_strip_dirty_y1[strip]) atlas_strip_dirty_y1[strip] = (u8)ty1;
+}
+static inline void atlas_mark_strip_dirty(int strip) {
+    atlas_mark_strip_dirty_rows(strip, 0, 254); /* full range */
 }
 
 /* Pool-strip addressing helpers (see PoolStrip). All pool texel writes go
@@ -561,9 +581,18 @@ static inline int pool_slot_strip_tiles_x(const TexturePoolSlot* s) {
 static inline int pool_slot_base_tx(const TexturePoolSlot* s) {
     return s->cell * (int)(s->pot_w >> 3);
 }
-static inline void pool_mark_slot_dirty(const TexturePoolSlot* s) {
+static inline void pool_mark_slot_dirty_rows(const TexturePoolSlot* s, int ty0, int ty1) {
     pool_strips[s->strip].dirty = true;
     atlas_dirty = true; /* shared "some strip needs flushing" gate */
+    if (s->strip < POOL_STRIP_TRACK_MAX) {
+        if (ty0 < 0) ty0 = 0;
+        if (ty1 > 254) ty1 = 254;
+        if (ty0 < pool_strip_dirty_y0[s->strip]) pool_strip_dirty_y0[s->strip] = (u8)ty0;
+        if (ty1 > pool_strip_dirty_y1[s->strip]) pool_strip_dirty_y1[s->strip] = (u8)ty1;
+    }
+}
+static inline void pool_mark_slot_dirty(const TexturePoolSlot* s) {
+    pool_mark_slot_dirty_rows(s, 0, 254); /* full range */
 }
 /* Zero the slot's own cell within its strip (replaces whole-texture memset). */
 static void pool_clear_slot(const TexturePoolSlot* s) {
@@ -575,16 +604,45 @@ static void pool_clear_slot(const TexturePoolSlot* s) {
         memset(&base[(ty * stx + btx) * 64], 0, (size_t)tw * 64 * sizeof(texel_t));
 }
 
+/* Flush only the dirty tile-row band of a strip texture. Tile rows are
+ * contiguous in the linear buffer (tiles stored row-major, 64 texels each),
+ * so [ty0..ty1] maps to one contiguous byte range. Falls back to the full
+ * C3D_TexFlush when the band covers (or exceeds) the whole texture. */
+static void flush_tex_rows(C3D_Tex* t, int ty0, int ty1) {
+    int rows_total = t->height >> 3;
+    if (ty1 >= rows_total) ty1 = rows_total - 1;
+    if (ty0 < 0) ty0 = 0;
+    if (ty1 < ty0) return;
+    if (ty0 == 0 && ty1 == rows_total - 1) {
+        C3D_TexFlush(t);
+        return;
+    }
+    size_t row_bytes = (size_t)(t->width >> 3) * 64 * sizeof(texel_t);
+    GSPGPU_FlushDataCache((u8*)t->data + (size_t)ty0 * row_bytes,
+                          (u32)((size_t)(ty1 - ty0 + 1) * row_bytes));
+}
+
 static void atlas_flush_pending_strips(void) {
     if (!atlas_dirty) return;
     for (int s = 0; s < atlas.strip_count; s++) {
-        if (atlas_strip_flush_pending & (1u << s))
-            C3D_TexFlush(&atlas.strip_tex[s]);
+        if (atlas_strip_flush_pending & (1u << s)) {
+            flush_tex_rows(&atlas.strip_tex[s],
+                           atlas_strip_dirty_y0[s], atlas_strip_dirty_y1[s]);
+            atlas_strip_dirty_y0[s] = STRIP_ROWS_EMPTY_Y0;
+            atlas_strip_dirty_y1[s] = 0;
+        }
     }
     atlas_strip_flush_pending = 0;
     for (int i = 0; i < pool_strip_count; i++) {
         if (pool_strips[i].dirty) {
-            C3D_TexFlush(&pool_strips[i].tex);
+            if (i < POOL_STRIP_TRACK_MAX) {
+                flush_tex_rows(&pool_strips[i].tex,
+                               pool_strip_dirty_y0[i], pool_strip_dirty_y1[i]);
+                pool_strip_dirty_y0[i] = STRIP_ROWS_EMPTY_Y0;
+                pool_strip_dirty_y1[i] = 0;
+            } else {
+                C3D_TexFlush(&pool_strips[i].tex);
+            }
             pool_strips[i].dirty = false;
         }
     }
@@ -1574,12 +1632,20 @@ static void cache_update_entry_region(CacheEntry* entry, int x, int y, int w, in
         }
     }
 
-    if (is_atlas) {
-        int cell = entry->atlas_cell;
-        if (cell >= 0 && cell < atlas_cell_count)
-            atlas_mark_strip_dirty(atlas_cell_strip(cell));
-    } else {
-        pool_mark_slot_dirty(&texture_pool[entry->pool_slot]);
+    {
+        /* Exact dst tile rows this patch wrote (Y-flipped): flushing just
+         * this band instead of the whole 512KB strip is the difference
+         * between a per-frame full-strip upload and a few KB on streaming
+         * scenes (melt-animated sheets). */
+        int dst_ty0 = (tiles_y - 1) - src_tile_y1;
+        int dst_ty1 = (tiles_y - 1) - src_tile_y0;
+        if (is_atlas) {
+            int cell = entry->atlas_cell;
+            if (cell >= 0 && cell < atlas_cell_count)
+                atlas_mark_strip_dirty_rows(atlas_cell_strip(cell), dst_ty0, dst_ty1);
+        } else {
+            pool_mark_slot_dirty_rows(&texture_pool[entry->pool_slot], dst_ty0, dst_ty1);
+        }
     }
     entry->dirty = false;
     entry->last_used_frame = frame_number;
