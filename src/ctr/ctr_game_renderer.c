@@ -907,10 +907,10 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
                 tile_dst[m[7]] = pal_colors[s[7]];
                 if (l8) {
                     u8* idx = &l8[(l8_row_base + tx) * 64];
-                    idx[m[0]] = s[0]; idx[m[1]] = s[1];
-                    idx[m[2]] = s[2]; idx[m[3]] = s[3];
-                    idx[m[4]] = s[4]; idx[m[5]] = s[5];
-                    idx[m[6]] = s[6]; idx[m[7]] = s[7];
+                    *(u16*)&idx[m[0]] = (u16)(s[0] | (s[1] << 8));
+                    *(u16*)&idx[m[2]] = (u16)(s[2] | (s[3] << 8));
+                    *(u16*)&idx[m[4]] = (u16)(s[4] | (s[5] << 8));
+                    *(u16*)&idx[m[6]] = (u16)(s[6] | (s[7] << 8));
                 }
             }
         }
@@ -1973,10 +1973,10 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
                     *(u32*)&tile_dst[m[6]] = (u32)pal_colors[s[6]] | ((u32)pal_colors[s[7]] << 16);
                     if (l8_new) {
                         u8* idx_dst = &l8_new->indices[(row_base + tx) * 64];
-                        idx_dst[m[0]] = s[0]; idx_dst[m[1]] = s[1];
-                        idx_dst[m[2]] = s[2]; idx_dst[m[3]] = s[3];
-                        idx_dst[m[4]] = s[4]; idx_dst[m[5]] = s[5];
-                        idx_dst[m[6]] = s[6]; idx_dst[m[7]] = s[7];
+                        *(u16*)&idx_dst[m[0]] = (u16)(s[0] | (s[1] << 8));
+                        *(u16*)&idx_dst[m[2]] = (u16)(s[2] | (s[3] << 8));
+                        *(u16*)&idx_dst[m[4]] = (u16)(s[4] | (s[5] << 8));
+                        *(u16*)&idx_dst[m[6]] = (u16)(s[6] | (s[7] << 8));
                     }
                 }
             }
@@ -4023,10 +4023,11 @@ static void melt_flush_pending(void) {
                                 for (int fy = 0; fy < 8; fy++) {
                                     const u8* srow = px8 + (sy0 + fy) * s->w + stx;
                                     const u8* m = morton_row[7 - fy];
-                                    dst[m[0]] = srow[0]; dst[m[1]] = srow[1];
-                                    dst[m[2]] = srow[2]; dst[m[3]] = srow[3];
-                                    dst[m[4]] = srow[4]; dst[m[5]] = srow[5];
-                                    dst[m[6]] = srow[6]; dst[m[7]] = srow[7];
+                                    /* morton x-pairs adjacent → u16 stores */
+                                    *(u16*)&dst[m[0]] = (u16)(srow[0] | (srow[1] << 8));
+                                    *(u16*)&dst[m[2]] = (u16)(srow[2] | (srow[3] << 8));
+                                    *(u16*)&dst[m[4]] = (u16)(srow[4] | (srow[5] << 8));
+                                    *(u16*)&dst[m[6]] = (u16)(srow[6] | (srow[7] << 8));
                                 }
                             } else {
                                 for (int fy = 0; fy < 8; fy++) {
