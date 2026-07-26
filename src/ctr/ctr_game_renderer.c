@@ -377,6 +377,24 @@ static void l8_resolve_palette(const L8CacheEntry* l8, const texel_t* palette,
                                 texel_t* tex_data, int tiles_x, int tiles_y,
                                 int dst_tiles_x, int dst_base_tx);
 
+/* Palette CONTENT-version history: flash effects (EX/hit/parry, super
+ * darkens, Twelve's metamor) rewrite a palette's CONTENT in place and
+ * restore it a few frames later (ColorRAM row → palUpdateGhostCP3). With a
+ * monotonically bumped version, the SAME two contents invalidated and
+ * rebuilt every sheet entry on EVERY flash, forever — the EX-move stutter
+ * that survived every pipeline optimization. Remember recent contents by
+ * hash and restore their old version number when they return: every cache
+ * entry built under that content revalidates by key, so flash cycles build
+ * once per session and then bind cached entries. Two independent hashes
+ * guard against 32-bit collisions. */
+#define PAL_VER_HIST 4
+static u32 pal_hist_sum[FL_PALETTE_MAX][PAL_VER_HIST];
+static u32 pal_hist_sum2[FL_PALETTE_MAX][PAL_VER_HIST];
+static u16 pal_hist_cnt[FL_PALETTE_MAX][PAL_VER_HIST];
+static u32 pal_hist_ver[FL_PALETTE_MAX][PAL_VER_HIST];
+static u8 pal_hist_n[FL_PALETTE_MAX];
+static u8 pal_hist_next[FL_PALETTE_MAX];
+
 // Version counters — incremented on every Create/Unlock
 u32 texture_versions[FL_TEXTURE_MAX];
 static u32 palette_versions[FL_PALETTE_MAX];
@@ -4342,8 +4360,37 @@ void SDLGameRenderer_CreatePalette(unsigned int ph) {
     p->checksum = checksum;
     p->valid = true;
     if (changed) {
-        palette_versions[idx]++;
-        cache_mark_palette_dirty(idx);
+        /* Returning content? Restore its old version — see pal_hist_* notes. */
+        u32 sum2 = 0x811C9DC5u;
+        {
+            const u8* b = (const u8*)new_colors;
+            size_t nb = (size_t)color_count * sizeof(texel_t);
+            for (size_t k = nb; k > 0; k--) { sum2 ^= b[k - 1]; sum2 *= 16777619u; }
+        }
+        int hit = -1;
+        for (int h = 0; h < pal_hist_n[idx]; h++) {
+            if (pal_hist_sum[idx][h] == checksum &&
+                pal_hist_sum2[idx][h] == sum2 &&
+                pal_hist_cnt[idx][h] == (u16)color_count) {
+                hit = h;
+                break;
+            }
+        }
+        if (hit >= 0) {
+            /* Entries built under this content become valid again purely by
+             * version equality — no dirty marking, no rebuilds. */
+            palette_versions[idx] = pal_hist_ver[idx][hit];
+        } else {
+            palette_versions[idx]++;
+            cache_mark_palette_dirty(idx);
+            int slot = pal_hist_next[idx];
+            pal_hist_sum[idx][slot] = checksum;
+            pal_hist_sum2[idx][slot] = sum2;
+            pal_hist_cnt[idx][slot] = (u16)color_count;
+            pal_hist_ver[idx][slot] = palette_versions[idx];
+            pal_hist_next[idx] = (u8)((slot + 1) % PAL_VER_HIST);
+            if (pal_hist_n[idx] < PAL_VER_HIST) pal_hist_n[idx]++;
+        }
     }
 }
 
