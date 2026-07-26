@@ -2933,7 +2933,7 @@ static void init_byte_to_float(void) {
 static void batch_write_quad(int quad_idx,
                               const float px[4], const float py[4],
                               const float u[4], const float v[4],
-                              u32 color) {
+                              u32 color, float z) {
     float cr = byte_to_float[(color >> 16) & 0xFF];
     float cg = byte_to_float[(color >>  8) & 0xFF];
     float cb = byte_to_float[ color        & 0xFF];
@@ -2943,19 +2943,19 @@ static void batch_write_quad(int quad_idx,
     BatchVertex* vp = &batch_vtx_buf[vbase];
 
     // Unrolled — avoid loop overhead on ARM
-    vp[0].x = px[0]; vp[0].y = py[0]; vp[0].z = 0.5f;
+    vp[0].x = px[0]; vp[0].y = py[0]; vp[0].z = z;
     vp[0].u = u[0];  vp[0].v = v[0];
     vp[0].r = cr; vp[0].g = cg; vp[0].b = cb; vp[0].a = ca;
 
-    vp[1].x = px[1]; vp[1].y = py[1]; vp[1].z = 0.5f;
+    vp[1].x = px[1]; vp[1].y = py[1]; vp[1].z = z;
     vp[1].u = u[1];  vp[1].v = v[1];
     vp[1].r = cr; vp[1].g = cg; vp[1].b = cb; vp[1].a = ca;
 
-    vp[2].x = px[2]; vp[2].y = py[2]; vp[2].z = 0.5f;
+    vp[2].x = px[2]; vp[2].y = py[2]; vp[2].z = z;
     vp[2].u = u[2];  vp[2].v = v[2];
     vp[2].r = cr; vp[2].g = cg; vp[2].b = cb; vp[2].a = ca;
 
-    vp[3].x = px[3]; vp[3].y = py[3]; vp[3].z = 0.5f;
+    vp[3].x = px[3]; vp[3].y = py[3]; vp[3].z = z;
     vp[3].u = u[3];  vp[3].v = v[3];
     vp[3].r = cr; vp[3].g = cg; vp[3].b = cb; vp[3].a = ca;
 
@@ -3124,26 +3124,87 @@ void SDLGameRenderer_RenderFrame(void) {
     sort_render_tasks(render_task_count);
     render_ticks_sort += svcGetSystemTick() - tick_sort_start;
 
-    // --- Pass 1: Fill vertex + index buffers, record resolved texture per quad ---
-    // We use a parallel array to store the resolved C3D_Tex* for each quad,
-    // since we need it during the draw-batch pass.
-    C3D_Tex* quad_textures[RENDER_TASK_MAX];
-    int quad_count = 0;
+    /* --- Pass 1: resolve textures, classify opaque vs transparent ---
+     * STAGE 1 (verified correct via screenshot, user-confirmed "fights
+     * look correct now"): real per-quad depth (z = 1.0 - rank/count — the
+     * DIRECTION was empirically flipped from the first attempt; the raw
+     * depth encoding runs opposite to what the shader-matrix math alone
+     * predicted, see perf-60fps-goal memory) + depth test replaces strict
+     * submission-order compositing with ZERO change to draw-call count
+     * (same order, same batching as before — a pure correctness proof).
+     * STAGE 2 (this code): now that depth genuinely reproduces painter's
+     * order, OPAQUE quads (vertex alpha==255 — the vast majority; only
+     * genuine fades/ghosts/flashes carry partial alpha) can be re-batched
+     * by TEXTURE ALONE instead of z-order — the depth test resolves final
+     * visibility correctly regardless of submission order. TRANSPARENT
+     * quads keep the exact existing z-order (depth test on, write off —
+     * standard technique: occluded correctly by nearer opaque content,
+     * doesn't corrupt the depth buffer for other transparent quads). */
+    static C3D_Tex* pending_tex[BATCH_MAX_QUADS];
+    static const RenderTask* pending_task[BATCH_MAX_QUADS];
+    static float pending_u[BATCH_MAX_QUADS][4], pending_v[BATCH_MAX_QUADS][4];
+    static u32 pending_color[BATCH_MAX_QUADS];
+    static float pending_z[BATCH_MAX_QUADS];
+    static int opaque_list[BATCH_MAX_QUADS], transparent_list[BATCH_MAX_QUADS];
+    int opaque_n = 0, transparent_n = 0;
+    int pending_count = 0;
 
     u64 tick_fill_start = svcGetSystemTick();
     for (int i = 0; i < render_task_count; i++) {
-        if (quad_count >= BATCH_MAX_QUADS) break;
+        if (pending_count >= BATCH_MAX_QUADS) break;
 
         const RenderTask* task = &render_tasks[sort_indices[i]];
         u32 color = task->vertex_colors[0];
-        if (((color >> 24) & 0xFF) == 0) continue;  // fully transparent
+        u8 alpha = (u8)(color >> 24);
+        if (alpha == 0) continue;  // fully transparent
 
         float u[4], v[4];
         C3D_Tex* tex = resolve_task_texture(task, u, v);
         if (!tex) continue;
 
-        batch_write_quad(quad_count, task->px, task->py, u, v, color);
-        quad_textures[quad_count] = tex;
+        int p = pending_count++;
+        pending_tex[p] = tex;
+        pending_task[p] = task;
+        pending_u[p][0] = u[0]; pending_u[p][1] = u[1]; pending_u[p][2] = u[2]; pending_u[p][3] = u[3];
+        pending_v[p][0] = v[0]; pending_v[p][1] = v[1]; pending_v[p][2] = v[2]; pending_v[p][3] = v[3];
+        pending_color[p] = color;
+        pending_z[p] = 1.0f - (float)i / (float)render_task_count;
+
+        if (alpha == 255) opaque_list[opaque_n++] = p;
+        else transparent_list[transparent_n++] = p;
+    }
+
+    /* Re-batch the opaque group by texture pointer alone (any grouping is
+     * correct — depth test resolves visibility regardless of order within
+     * or across texture groups). Simple insertion sort: opaque_n is at
+     * most a few hundred in the heaviest observed frames, so worst-case
+     * O(n²) is microseconds on this budget. */
+    for (int a = 1; a < opaque_n; a++) {
+        int key = opaque_list[a];
+        uintptr_t key_tex = (uintptr_t)pending_tex[key];
+        int b = a - 1;
+        while (b >= 0 && (uintptr_t)pending_tex[opaque_list[b]] > key_tex) {
+            opaque_list[b + 1] = opaque_list[b];
+            b--;
+        }
+        opaque_list[b + 1] = key;
+    }
+
+    C3D_Tex* quad_textures[BATCH_MAX_QUADS];
+    int quad_count = 0;
+    for (int a = 0; a < opaque_n; a++) {
+        int p = opaque_list[a];
+        batch_write_quad(quad_count, pending_task[p]->px, pending_task[p]->py,
+                         pending_u[p], pending_v[p], pending_color[p], pending_z[p]);
+        quad_textures[quad_count] = pending_tex[p];
+        quad_count++;
+    }
+    int opaque_quad_count = quad_count; /* boundary for the depth-write toggle below */
+    for (int a = 0; a < transparent_n; a++) {
+        int p = transparent_list[a];
+        batch_write_quad(quad_count, pending_task[p]->px, pending_task[p]->py,
+                         pending_u[p], pending_v[p], pending_color[p], pending_z[p]);
+        quad_textures[quad_count] = pending_tex[p];
         quad_count++;
     }
     render_ticks_fill += svcGetSystemTick() - tick_fill_start;
@@ -3159,7 +3220,17 @@ void SDLGameRenderer_RenderFrame(void) {
     BufInfo_Init(bufInfo);
     BufInfo_Add(bufInfo, batch_vtx_buf, sizeof(BatchVertex), 3, 0x210);
 
-    // --- Pass 2: Draw in batches, one C3D_DrawElements per texture change ---
+    /* Depth test ON for both groups — write mask differs: opaque writes
+     * depth (resolves future same-pass comparisons), transparent doesn't
+     * (standard technique). Restored to today's global off-state before
+     * returning, so nothing drawn later this frame (crop bars, bottom
+     * screen, glyphs) is affected. */
+    C3D_DepthTest(true, GPU_GEQUAL, GPU_WRITE_ALL);
+
+    // --- Pass 2: Draw in batches, one C3D_DrawElements per texture change.
+    // Same batching loop as before, just over two sub-ranges now (opaque
+    // re-sorted by texture, transparent unchanged) with a depth-write
+    // toggle at the boundary. ---
     C3D_Tex* cur_tex = NULL;
     int batch_start_idx = 0;  // index into the index buffer (in units of indices)
     u64 tick_submit_start = svcGetSystemTick();
@@ -3169,6 +3240,10 @@ void SDLGameRenderer_RenderFrame(void) {
 
         if (q == quad_count) {
             // End of all quads — flush remaining batch
+            flush = true;
+        } else if (q == opaque_quad_count) {
+            // Opaque/transparent boundary — always flush + switch write
+            // mask, even if the texture happens to match across it.
             flush = true;
         } else if (cur_tex != NULL && quad_textures[q] != cur_tex) {
             // Texture changed — flush previous batch
@@ -3189,11 +3264,19 @@ void SDLGameRenderer_RenderFrame(void) {
             cur_tex = NULL;
         }
 
+        if (q == opaque_quad_count && q < quad_count) {
+            C3D_DepthTest(true, GPU_GEQUAL, GPU_WRITE_COLOR); /* transparent: test, don't write */
+        }
+
         if (q < quad_count) {
             cur_tex = quad_textures[q];
         }
     }
     render_ticks_submit += svcGetSystemTick() - tick_submit_start;
+
+    /* Restore today's global depth-off default for anything drawn later
+     * this frame (crop bars, bottom-screen art, glyphs — all via citro2d). */
+    C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_ALL);
 
     /* Per-frame quick stats (every 120 frames). The old per-quad atlas-vs-
      * pool membership scan (quads x cells x strips pointer compares EVERY
