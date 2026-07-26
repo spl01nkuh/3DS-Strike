@@ -4377,9 +4377,23 @@ void SDLGameRenderer_CreatePalette(unsigned int ph) {
             }
         }
         if (hit >= 0) {
-            /* Entries built under this content become valid again purely by
-             * version equality — no dirty marking, no rebuilds. */
+            /* Returning content: restore its version. Entries already
+             * holding it revalidate by version equality (zero work). But
+             * POOL entries validate by their dirty flag, not pal_version —
+             * any entry holding a DIFFERENT content generation must still
+             * be told to rebuild, or it serves the old colors forever
+             * (measured: character stuck flash-yellow after an EX). Mark
+             * ONLY those; matching entries stay clean. */
             palette_versions[idx] = pal_hist_ver[idx][hit];
+            for (int ci = 0; ci < CACHE_MAX; ci++) {
+                CacheEntry* e = &gpu_cache[ci];
+                if (!e->allocated || e->pending_delete) continue;
+                if (e->palette_index != idx) continue;
+                if (e->pal_version != palette_versions[idx]) {
+                    e->dirty = true;
+                    queue_pending_texture(e->texture_index, e->palette_index);
+                }
+            }
         } else {
             palette_versions[idx]++;
             cache_mark_palette_dirty(idx);
