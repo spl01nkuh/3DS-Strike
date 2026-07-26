@@ -345,14 +345,24 @@ static SrcPalette src_palettes[FL_PALETTE_MAX];
 /* L8 index cache (see the "L8 Index Cache" section further down for the
  * implementation) — type + prototypes up here because atlas_build_cell's
  * cross-variant fast path needs them. */
-#define L8_CACHE_MAX 64 /* was 24/32/48 — char select cycles 10+ sheets per
-                         * hovered character through this cache, and every
-                         * miss turns a ~2ms fast re-resolve into a 6.7ms full
-                         * rebuild during the super-art preview (measured:
-                         * sequential ti=8..14 rebuild bursts at select).
-                         * 48→64: atlas cell builds now share this cache for
-                         * cross-variant resolves (EX/super flash first binds),
-                         * adding the char sheets to its working set. */
+#define L8_CACHE_MAX 128 /* was 24/32/48/64 — raised again alongside the
+                          * switch to BYTE-BUDGETED eviction below: this is
+                          * now just an upper bound on ENTRY COUNT (fixed
+                          * array size), not the real capacity limit. */
+#define L8_CACHE_BUDGET (10 * 1024 * 1024) /* was unbounded-by-bytes: with a
+                          * single pool of pure-COUNT slots shared by both
+                          * atlas cross-variant sharing AND the pool path's
+                          * own big-sheet cache, entries range 64KB (256x256)
+                          * to 256KB (512x512) — a burst of small atlas
+                          * entries could evict a large sheet that's still
+                          * in active rotation purely by recency, with no
+                          * regard for the size/cost being evicted. Measured:
+                          * sustained heavy fights still full-rebuilding
+                          * 512x512/512x256/256x512 sheets repeatedly
+                          * (BUILDSPIKE clusters of 5+ within under a
+                          * second) even after cross-variant sharing landed.
+                          * Old-3DS 64MB budget (task #12) needs revisiting
+                          * this alongside the 44MB AFS cache. */
 typedef struct {
     int texture_index;   // which source texture this caches
     u32 tex_version;     // version when indices were captured
@@ -1150,8 +1160,35 @@ static L8CacheEntry* l8_cache_find(int tex_idx, u32 tex_ver) {
     return NULL;
 }
 
+static u32 l8_cache_bytes = 0; /* running total of all valid entries' indices buffers */
+
 static L8CacheEntry* l8_cache_alloc(int tex_idx, u32 tex_ver, int pot_w, int pot_h) {
-    // Find free slot or LRU evict
+    size_t need = (size_t)pot_w * pot_h;
+
+    /* Evict LRU entries (regardless of free-slot availability) until this
+     * allocation fits the byte budget — the fix for size-blind eviction:
+     * a burst of small (256x256, 64KB) entries could previously evict a
+     * large (512x512, 256KB) one purely by recency, even though the large
+     * one costs 4x more to rebuild and the small ones cost little to keep
+     * refreshing. Budget-first means a big sheet's presence now correctly
+     * reserves proportionally more of the cache than a small one's. */
+    while (l8_cache_bytes + need > L8_CACHE_BUDGET) {
+        L8CacheEntry* victim = NULL;
+        u32 oldest = UINT32_MAX;
+        for (int i = 0; i < L8_CACHE_MAX; i++) {
+            if (l8_cache[i].valid && l8_cache[i].last_used < oldest) {
+                oldest = l8_cache[i].last_used;
+                victim = &l8_cache[i];
+            }
+        }
+        if (!victim) break; /* nothing left to evict — budget alone can't be met */
+        l8_cache_bytes -= (u32)((size_t)victim->pot_w * victim->pot_h);
+        free(victim->indices);
+        victim->indices = NULL;
+        victim->valid = false;
+    }
+
+    // Find free slot, or LRU evict one more if the array itself is full
     L8CacheEntry* best = NULL;
     u32 oldest = UINT32_MAX;
     for (int i = 0; i < L8_CACHE_MAX; i++) {
@@ -1159,9 +1196,9 @@ static L8CacheEntry* l8_cache_alloc(int tex_idx, u32 tex_ver, int pot_w, int pot
         if (l8_cache[i].last_used < oldest) { oldest = l8_cache[i].last_used; best = &l8_cache[i]; }
     }
     if (!best) return NULL;
+    if (best->valid) l8_cache_bytes -= (u32)((size_t)best->pot_w * best->pot_h);
 
     // Realloc if size changed
-    size_t need = (size_t)pot_w * pot_h;
     if (best->indices && (best->pot_w != pot_w || best->pot_h != pot_h)) {
         free(best->indices);
         best->indices = NULL;
@@ -1170,6 +1207,7 @@ static L8CacheEntry* l8_cache_alloc(int tex_idx, u32 tex_ver, int pot_w, int pot
         best->indices = (u8*)malloc(need);
         if (!best->indices) return NULL;
     }
+    l8_cache_bytes += (u32)need;
     /* index 0 == transparent (pal_colors[0] forced 0): padding tiles the
      * build never writes must not hold malloc garbage, or a later palette
      * re-resolve paints noise into them */
@@ -1486,6 +1524,13 @@ static void cache_update_entry_region(CacheEntry* entry, int x, int y, int w, in
     if (src->fmt != SCE_GS_PSMT8) {
         for (int li = 0; li < L8_CACHE_MAX; li++) {
             if (l8_cache[li].valid && l8_cache[li].texture_index == entry->texture_index) {
+                /* indices buffer is intentionally kept allocated for reuse
+                 * (avoids a free+malloc round-trip if this exact size comes
+                 * back), but its bytes must leave the budget NOW — l8_cache_
+                 * alloc's reuse path only re-subtracts when best->valid was
+                 * still true, so leaving this out silently double-counted
+                 * these bytes on every future reuse of this slot. */
+                l8_cache_bytes -= (u32)((size_t)l8_cache[li].pot_w * l8_cache[li].pot_h);
                 l8_cache[li].valid = false;
             }
         }
@@ -3892,7 +3937,10 @@ void SDLGameRenderer_DestroyTexture(unsigned int texture_handle) {
     destroy_texture_counts[idx]++;
     // Invalidate L8 index cache for this texture
     for (int li = 0; li < L8_CACHE_MAX; li++) {
-        if (l8_cache[li].valid && l8_cache[li].texture_index == idx) l8_cache[li].valid = false;
+        if (l8_cache[li].valid && l8_cache[li].texture_index == idx) {
+            l8_cache_bytes -= (u32)((size_t)l8_cache[li].pot_w * l8_cache[li].pot_h);
+            l8_cache[li].valid = false;
+        }
     }
     cache_invalidate_texture(idx);
     pending_remove_texture(idx);
