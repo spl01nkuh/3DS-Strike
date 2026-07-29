@@ -248,10 +248,6 @@ void texture_cash_update() {
      * first-use of every move runs at full speed (see MTRANS.c). */
     { extern void mlt_prewarm_tick(void); mlt_prewarm_tick(); }
 
-    /* 3DS: boot-time background preload of known one-shot monster files
-     * (8.8MB select-screen bundle etc.) into the AFS cache — see afs.c. */
-    { extern void afsPreloadPump(void); afsPreloadPump(); }
-
     /* 3DS LOADING WINDOWS (user plan): every scene transition (G_No change —
      * covers boot→attract, →char select, →VS/fight, fight→score, all four
      * planned points) arms a ~4s boosted-decode window and re-arms completed
@@ -267,39 +263,6 @@ void texture_cash_update() {
             pv_gno1 = G_No[1];
             mlt_prewarm_boost(240);
             mlt_prewarm_restart();
-        }
-    }
-
-    /* PROBE (cheap, every ~2s): per-group ACTIVITY DELTAS — distinguishes,
-     * for a PARKED preview, whether a group keeps rebuilding pattern
-     * instances (bld>0: its CG loop cycles the 64-entry PatternCollection →
-     * constant rebuild + lookup-scan work) vs replaying cached instances
-     * (hit-only). Also slot-count growth (du16/du32 = new tiles melted). */
-    {
-        extern void debug_print(const char *fmt, ...);
-        extern u32 g_pat_build[24];
-        extern u32 g_pat_hit[24];
-        static u32 gs_frames = 0;
-        static u32 pv_build[24], pv_hit[24];
-        static s32 pv_u16[24], pv_u32[24];
-        if ((++gs_frames % 120) == 0) {
-            for (s16 gx = 0; gx < 24; gx++) {
-                if (!mts_ok[gx].be) continue;
-                if (!(mts[gx].ext && mts[gx].tpf && mts[gx].tpu)) continue;
-                u32 db = g_pat_build[gx] - pv_build[gx];
-                u32 dh = g_pat_hit[gx] - pv_hit[gx];
-                s32 du16 = mts[gx].tpu->x16 - pv_u16[gx];
-                s32 du32 = mts[gx].tpu->x32 - pv_u32[gx];
-                pv_build[gx] = g_pat_build[gx];
-                pv_hit[gx] = g_pat_hit[gx];
-                pv_u16[gx] = mts[gx].tpu->x16;
-                pv_u32[gx] = mts[gx].tpu->x32;
-                if (db == 0 && dh == 0 && du16 == 0 && du32 == 0) continue;
-                debug_print("GRPACT ix=%d bld=%u hit=%u du16=%d du32=%d f16=%d f32=%d kazu=%d",
-                            gx, db, dh, du16, du32,
-                            mts[gx].tpf->x16, mts[gx].tpf->x32,
-                            mts[gx].cpat ? mts[gx].cpat->kazu : -1);
-            }
         }
     }
 
@@ -528,6 +491,14 @@ void purge_texcash_work(s16 ix) {
     if (ix >= 0 && ix < 24) {
         texcash_purge_counts[ix]++;
     }
+
+    /* 3DS: the group's slot/pool state (mltcsh16, tpf, tpu) lives in the ram
+     * keys released just below, but prewarm jobs hold a raw MultiTexture* to
+     * it. Cancel them here as the build path already does, or the next tick
+     * walks tpu->x16_used through freed memory — and prewarm_slot16 also
+     * WRITES back through those pointers, corrupting whatever now owns the
+     * block. */
+    { extern void mlt_prewarm_reset(void); mlt_prewarm_reset(); }
 
     if ((Test_ramcnt_key(mts_ok[ix].key0) != 0) && (Test_ramcnt_key(mts_ok[ix].key1) != 0)) {
         Push_ramcnt_key_original(mts_ok[ix].key0);

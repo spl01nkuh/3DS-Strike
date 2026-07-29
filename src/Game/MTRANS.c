@@ -128,13 +128,6 @@ static inline u16 x32_mapping_set(PatternMap* map, s32 code);
  * mlt_prewarm_tick() — called once per frame from texture_cash_update() —
  * walks the group's full CG table decoding missing tiles under a strict
  * per-frame time budget. By "FIGHT!" both characters are fully decoded. */
-/* P1-vs-P2 char-select diagnosis: per-group pattern-instance cache hit/build
- * counters. A parked preview that keeps BUILDING (vs hitting) means its CG
- * loop cycles the 64-entry PatternCollection pool → constant rebuild work.
- * Read as deltas by the GRPSTAT probe (texcash.c). */
-u32 g_pat_build[24];
-u32 g_pat_hit[24];
-
 #define PREWARM_JOBS_MAX 12 /* fights can now register fx + cx jobs per
                              * player plus stage/menu groups */
 typedef struct {
@@ -358,9 +351,8 @@ void mlt_prewarm_tick(void) {
     /* ~1.5ms budget per frame normally; ~5ms inside a post-transition
      * loading window (VS card, round intro, fades — scenes with slack),
      * so whole charsets finish before gameplay. Boot demos (G_No[0]==0:
-     * warning/CAPCOM logo) are EXCLUDED from the boost — the blocking
-     * PREPARE TO STRIKE screen already frontloads everything, and a 5ms
-     * decode budget during the logo was costing it its 60fps. */
+     * warning/CAPCOM logo) are EXCLUDED from the boost — a 5ms decode
+     * budget during the logo was costing it its 60fps. */
     u64 budget = (u64)(0.0015 * 268111856.0);
     if (prewarm_boost_frames) {
         prewarm_boost_frames--;
@@ -861,7 +853,6 @@ void mlt_obj_trans_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
     cc.parts.group = 0;
     cc.parts.offset = wk->cg_number;
     ix = check_patcash_ex_trans(mt->cpat, cc.code);
-    if (mt->id < 24) { if (ix < 0) g_pat_build[mt->id]++; else g_pat_hit[mt->id]++; }
 
     u16 x_flip = attr & 0x8000;
     u16 y_flip = attr & 0x4000;
@@ -1260,7 +1251,6 @@ void mlt_obj_trans_cp3_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
     cc.parts.group = 0;
     cc.parts.offset = wk->cg_number;
     ix = check_patcash_ex_trans(mt->cpat, cc.code);
-    if (mt->id < 24) { if (ix < 0) g_pat_build[mt->id]++; else g_pat_hit[mt->id]++; }
 
     u16 x_flip = flip & 0x8000;
     u16 y_flip = flip & 0x4000;
@@ -1692,7 +1682,6 @@ void mlt_obj_trans_rgb_ext(MultiTexture* mt, WORK* wk, s32 base_y) {
     cc.parts.group = wk->colcd;
     cc.parts.offset = wk->cg_number;
     ix = check_patcash_ex_trans(mt->cpat, cc.code);
-    if (mt->id < 24) { if (ix < 0) g_pat_build[mt->id]++; else g_pat_hit[mt->id]++; }
 
 
     u16 x_flip = flip & 0x8000;

@@ -117,36 +117,6 @@ static texel_t color16_4444_to_rgba(u16 p) {
  * SCE_GS_PSMCT16 lost the layout distinction at the translation boundary. */
 #define GSFMT_DIRECT_4444 0x4444
 
-/* Value LUTs for direct 16-bit formats (the old gu_draw.c trick): the
- * conversion is a pure function of the pixel value, so a lazily-built
- * 64Ki-entry table turns per-texel bit math + function call into one load.
- * 128KB each, malloc'd on first use only (title logo etc. — measured 56ms
- * for one 512x256 build through the per-texel path). */
-static texel_t* lut16_direct_5551;
-static texel_t* lut16_direct_4444;
-
-static const texel_t* lut16_direct_get(u32 fmt) {
-    if (fmt == SCE_GS_PSMCT16) {
-        if (!lut16_direct_5551) {
-            lut16_direct_5551 = (texel_t*)malloc(65536 * sizeof(texel_t));
-            if (lut16_direct_5551)
-                for (u32 v = 0; v < 65536; v++)
-                    lut16_direct_5551[v] = color16_direct_to_rgba((u16)v);
-        }
-        return lut16_direct_5551;
-    }
-    if (fmt == GSFMT_DIRECT_4444) {
-        if (!lut16_direct_4444) {
-            lut16_direct_4444 = (texel_t*)malloc(65536 * sizeof(texel_t));
-            if (lut16_direct_4444)
-                for (u32 v = 0; v < 65536; v++)
-                    lut16_direct_4444[v] = color16_4444_to_rgba((u16)v);
-        }
-        return lut16_direct_4444;
-    }
-    return NULL;
-}
-
 // Convert PS2 32-bit color (BGRA8888 in memory) to GPU_RGBA4
 static texel_t color32_to_rgba(u32 p) {
     u8 r = (u8)((p >> 16) & 0xFF);
@@ -632,6 +602,15 @@ static void pool_clear_slot(const TexturePoolSlot* s) {
         memset(&base[(ty * stx + btx) * 64], 0, (size_t)tw * 64 * sizeof(texel_t));
 }
 
+/* True when a row-based build of w x h source pixels writes every texel of a
+ * pot_w x pot_h slot, leaving no padding — the builds then overwrite the whole
+ * slot, so pre-clearing it is work the very next loop discards. The row loops
+ * cover whole 8x8 tiles only (full_tx = w >> 3), hence the multiple-of-8
+ * requirement. */
+static inline bool build_covers_slot(int w, int h, u32 pot_w, u32 pot_h) {
+    return w == (int)pot_w && h == (int)pot_h && (w & 7) == 0 && (h & 7) == 0;
+}
+
 /* Flush only the dirty tile-row band of a strip texture. Tile rows are
  * contiguous in the linear buffer (tiles stored row-major, 64 texels each),
  * so [ty0..ty1] maps to one contiguous byte range. Falls back to the full
@@ -817,84 +796,11 @@ static int atlas_alloc_cell(int cache_idx) {
     return -1; // All cells recently used — fall through to pool
 }
 
-// Forward declarations for GX build
-static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* pal,
-                              u32 pot_w, u32 pot_h);
-/* Staging buffer — defined and allocated later, declared here for GX build */
+/* Staging buffer for atlas cell builds */
 #define STAGING_MAX (512 * 512)
 static texel_t* staging_buf = NULL;
 
-// GX-accelerated build: CPU writes linear palette-resolved data,
-// GPU hardware does morton tiling via GX_DisplayTransfer.
-static C3D_Tex gx_temp_tex;
-static bool gx_temp_init = false;
-
-static void atlas_build_cell_gx(int cell, const SrcTexture* src, const SrcPalette* pal,
-                                  u32 pot_w, u32 pot_h) {
-    if (cell < 0 || cell >= atlas_cell_count || !atlas.cell_init[cell]) return;
-    if (!staging_buf || !src->pixels) return;
-
-    const u8* px = (const u8*)src->pixels;
-    const texel_t* palette = pal ? pal->colors : NULL;
-    if (!palette) return;
-    if (pot_w > 512 || pot_h > 512) return; /* staging_buf is 512×512 */
-
-    /* Step 1: palette resolve into linear staging buffer (sequential writes) */
-    int w = (src->w < (int)pot_w) ? src->w : (int)pot_w;
-    int h = (src->h < (int)pot_h) ? src->h : (int)pot_h;
-
-    if (src->fmt == SCE_GS_PSMT8) {
-        for (int y = 0; y < (int)pot_h; y++) {
-            int src_y = (int)pot_h - 1 - y; /* Y-flip for GPU */
-            texel_t* row_out = &staging_buf[y * (int)pot_w];
-            if (src_y >= 0 && src_y < h) {
-                const u8* src_row = px + src_y * src->w;
-                for (int x = 0; x < w; x++)
-                    row_out[x] = palette[src_row[x]];
-                if (w < (int)pot_w)
-                    memset(&row_out[w], 0, ((int)pot_w - w) * sizeof(texel_t));
-            } else {
-                memset(row_out, 0, (int)pot_w * sizeof(texel_t));
-            }
-        }
-    } else {
-        /* Non-PSMT8: fall back to CPU build */
-        atlas_build_cell(cell, src, pal, pot_w, pot_h);
-        return;
-    }
-
-    /* Step 2: GX_DisplayTransfer directly into the atlas strip cell region.
-       Write to the strip at the cell's tile offset. GX tiles for pot_w×pot_h. */
-    C3D_Tex* strip_tex = atlas_cell_tex(cell);
-    int cell_in = atlas_cell_in_strip(cell);
-    /* Byte offset of this cell within the strip texture data */
-    size_t cell_byte_offset = (size_t)cell_in * ATLAS_CELL_SIZE / 8 * 64 * sizeof(texel_t);
-    /* For cell 0 in a strip: offset=0. For cell 1: offset = 32*64*2 = 4096 */
-
-    GSPGPU_FlushDataCache(staging_buf, pot_w * pot_h * sizeof(texel_t));
-
-    /* GX transfer directly into the strip at cell offset.
-       Use pot dimensions so tiling matches a 256×256 standalone texture. */
-    GX_DisplayTransfer(
-        (u32*)staging_buf,
-        GX_BUFFER_DIM(pot_w, pot_h),
-        (u32*)((u8*)strip_tex->data + cell_byte_offset),
-        GX_BUFFER_DIM(pot_w, pot_h),
-        GX_TRANSFER_FLIP_VERT(0) |
-        GX_TRANSFER_OUT_TILED(1) |
-        GX_TRANSFER_RAW_COPY(0) |
-        GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA4) |
-        GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGBA4) |
-        GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO)
-    );
-    svcSleepThread(500000); /* 0.5ms — wait for GPU transfer */
-
-    C3D_TexFlush(strip_tex);
-    atlas_builds_total++;
-    atlas_builds_period++;
-}
-
-// CPU fallback build: morton tiling done on CPU.
+// CPU build: morton tiling done on CPU.
 static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* pal,
                               u32 pot_w, u32 pot_h) {
     if (cell < 0 || cell >= atlas_cell_count || !atlas.cell_init[cell]) return;
@@ -904,10 +810,23 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
     const u8* px = (const u8*)src->pixels;
     const texel_t* pal_colors = pal ? pal->colors : NULL;
 
-    // Clear this cell's region in the shared texture
-    for (int ty = 0; ty < local_tiles; ty++)
-        for (int tx = 0; tx < local_tiles; tx++)
-            memset(atlas_tile_ptr(cell, tx, ty), 0, 64 * TEXEL_BYTES);
+    /* Clear this cell's region in the shared texture — but only when the build
+     * below leaves any of it unwritten. Full-size PSMT8 content covers the cell
+     * exactly: the row loop walks all 32x32 tiles and every one of their 64
+     * texels, and the cross-variant L8 resolve (gated on the same full-cell
+     * size) rewrites the identical region. Sub-cell content still needs the
+     * padding tiles zeroed, and the non-PSMT8 branch is left conservative. */
+    {
+        int cw = (src->w < (int)pot_w) ? src->w : (int)pot_w;
+        int ch = (src->h < (int)pot_h) ? src->h : (int)pot_h;
+        bool covers_cell = (src->fmt == SCE_GS_PSMT8 && pal_colors &&
+                            cw == ATLAS_CELL_SIZE && ch == ATLAS_CELL_SIZE);
+        if (!covers_cell) {
+            for (int ty = 0; ty < local_tiles; ty++)
+                for (int tx = 0; tx < local_tiles; tx++)
+                    memset(atlas_tile_ptr(cell, tx, ty), 0, 64 * TEXEL_BYTES);
+        }
+    }
 
     /* NOTE: no special-casing for still-all-zero placeholder textures —
      * palette index 0 is forced transparent at capture (CPS3 rule), so
@@ -1127,14 +1046,6 @@ static u32 destroy_texture_counts[FL_TEXTURE_MAX] = { 0 };
 static u32 destroy_palette_counts[FL_PALETTE_MAX] = { 0 };
 static u64 cache_create_ticks_total = 0;
 static u64 cache_create_ticks_build = 0;
-/* Frame build tracking (no deferral — builds are immediate) */
-static u64 frame_build_used = 0;
-/* When true, cache_create skips full texture build — expects region updates
-   to fill needed tiles. Set during melt2 batch decode. */
-int gpu_cache_skip_full_build = 0;
-/* When true, skip atlas path — all textures go to pool.
-   Useful for screens with many unique textures where atlas thrashing hurts. */
-int gpu_cache_prefer_pool = 0;
 static u64 cache_create_ticks_flush = 0;
 static u32 cache_create_count_total = 0;
 /* Fine-grained timing for hot path analysis */
@@ -1156,7 +1067,7 @@ u32 dbg_settex_miss(void); u32 dbg_settex_create(void); u32 dbg_settex_fail(void
 
 // (hash table removed — simple scan is more reliable)
 
-// staging_buf and STAGING_MAX declared earlier (before atlas_build_cell_gx)
+// staging_buf and STAGING_MAX declared earlier (before atlas_build_cell)
 
 // ---------------------------------------------------------------------------
 // L8 Index Cache: caches morton-tiled 8-bit palette indices per texture page.
@@ -1728,16 +1639,6 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
     const SrcTexture* src = &src_textures[tex_idx];
     if (!src->valid || !staging_buf || !src->pixels) {
         cache_fail_invalid++;
-        { /* PORT DIAG: identify which texture indices are permanently
-             invalid, to trace back to their creation call site. TEMP. */
-            extern void debug_print(const char *fmt, ...);
-            static int seen[FL_TEXTURE_MAX];
-            if (tex_idx >= 0 && tex_idx < FL_TEXTURE_MAX && !seen[tex_idx]) {
-                seen[tex_idx] = 1;
-                debug_print("INVTEX idx=%d w=%d h=%d valid=%d px=%p",
-                            tex_idx, src->w, src->h, (int)src->valid, src->pixels);
-            }
-        }
         return NULL;
     }
 
@@ -1835,8 +1736,7 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
     } else if (pot_w > ATLAS_CELL_SIZE || pot_h > ATLAS_CELL_SIZE) {
         atlas_skip_big++;
     }
-    if (atlas.initialized && !gpu_cache_prefer_pool &&
-        pot_w <= ATLAS_CELL_SIZE && pot_h <= ATLAS_CELL_SIZE) {
+    if (atlas.initialized && pot_w <= ATLAS_CELL_SIZE && pot_h <= ATLAS_CELL_SIZE) {
         atlas_try_count++;
         int cache_idx = (int)(entry - gpu_cache);
         int cell = -1;
@@ -1881,9 +1781,7 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
                full rebuild via cache_create. */
             {   const u64 build_start_tick = svcGetSystemTick();
                 atlas_build_cell(cell, src, pal, pot_w, pot_h);
-                const u64 build_end_tick = svcGetSystemTick();
-                frame_build_used += build_end_tick - build_start_tick;
-                cache_create_ticks_build += build_end_tick - build_start_tick;
+                cache_create_ticks_build += svcGetSystemTick() - build_start_tick;
             }
             entry->dirty = false;
 
@@ -1968,13 +1866,6 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
     pot_w = texture_pool[slot_idx].pot_w;
     pot_h = texture_pool[slot_idx].pot_h;
 
-    if (gpu_cache_skip_full_build) {
-        /* Skip full build during melt2 only. */
-        pool_clear_slot(&texture_pool[slot_idx]);
-        pool_mark_slot_dirty(&texture_pool[slot_idx]);
-        goto pool_skip_build;
-    }
-
     // Build all tiles with morton tiling + vertical flip.
     // The slot is a cell inside a shared strip: destination tile rows use the
     // STRIP stride plus the cell's X offset; source-space math is unchanged.
@@ -2020,9 +1911,10 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
             /* PSMT4 row-based build: two pixels per byte, low nibble = even x
              * (same decode as resolve_texel). Captures indices for the fast
              * path above. */
-            pool_clear_slot(&texture_pool[slot_idx]);
             int w = (src->w < (int)pot_w) ? src->w : (int)pot_w;
             int h = (src->h < (int)pot_h) ? src->h : (int)pot_h;
+            if (!build_covers_slot(w, h, pot_w, pot_h))
+                pool_clear_slot(&texture_pool[slot_idx]);
             int full_tx = w >> 3;
             int src_half_w = src->w >> 1;
             for (int src_y = 0; src_y < h; src_y++) {
@@ -2062,10 +1954,11 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
 
         /* Row-based single-pass: sequential source reads, no per-tile call overhead.
            Also captures L8 indices in the same pass. */
-        pool_clear_slot(&texture_pool[slot_idx]);
         {
             int w = (src->w < (int)pot_w) ? src->w : (int)pot_w;
             int h = (src->h < (int)pot_h) ? src->h : (int)pot_h;
+            if (!build_covers_slot(w, h, pot_w, pot_h))
+                pool_clear_slot(&texture_pool[slot_idx]);
             int full_tx = w >> 3;
 
             for (int src_y = 0; src_y < h; src_y++) {
@@ -2079,18 +1972,6 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
 
                 for (int tx = 0; tx < full_tx; tx++) {
                     texel_t* tile_dst = &tex_data[(dst_row_base + tx) * 64];
-                    int tidx = row_base + tx;
-#ifdef __3DS__
-                    /* Only build tiles marked active by region updates.
-                       Seqs textures (has_region_updates=true): stale tiles → zero.
-                       Non-seqs textures: full build all tiles normally. */
-                    if (gpu_cache_prefer_pool && src->has_region_updates &&
-                        tidx < TILE_DIRTY_WORDS * 32 &&
-                        !(src->tile_dirty[tidx >> 5] & (1u << (tidx & 31)))) {
-                        memset(tile_dst, 0, 64 * sizeof(texel_t));
-                        continue;
-                    }
-#endif
                     const u8* s = src_row + tx * 8;
                     /* Morton x-pairs are always adjacent (bit0 = x&1), so
                      * write two texels per u32 store — bit-identical output,
@@ -2117,31 +1998,40 @@ l8_done:
     } else {
         // General path for PSMT4/PSMCT16/other
         pool_clear_slot(&texture_pool[slot_idx]);
-        /* Direct 16-bit sheets: LUT fast path for fully-interior tiles.
-         * The per-texel resolve_texel route (bounds check + fmt switch +
-         * bit-math per texel) measured 56ms for one 512x256 title-logo
-         * build — 3+ dropped frames from a single bind. */
-        const texel_t* lut16 = NULL;
-        const u16* px16 = NULL;
-        if ((src->fmt == SCE_GS_PSMCT16 || src->fmt == GSFMT_DIRECT_4444) && src->pixels) {
-            lut16 = lut16_direct_get(src->fmt);
-            px16 = (const u16*)src->pixels;
-        }
+        /* Direct 16-bit sheets: converted inline for fully-interior tiles,
+         * skipping the per-texel resolve_texel route (bounds check + fmt
+         * switch + call) that measured 56ms for one 512x256 title-logo build.
+         * The conversion is pure register bit-math, so it runs straight out of
+         * the pipeline; a 64Ki-entry value table used to stand in for it here,
+         * but at 128KB it thrashed a 16KB L1 / 256KB L2 and made a 512x256
+         * stage build cost 21ms of mostly cache-miss stalls. */
+        const bool direct16 =
+            (src->fmt == SCE_GS_PSMCT16 || src->fmt == GSFMT_DIRECT_4444) && src->pixels;
+        const bool is4444 = (src->fmt == GSFMT_DIRECT_4444);
+        const u16* px16 = direct16 ? (const u16*)src->pixels : NULL;
+
+#define CONV16_ROW(CONV)                                                            \
+        *(u32*)&tile_dst[m[0]] = (u32)CONV(srow[0]) | ((u32)CONV(srow[1]) << 16);    \
+        *(u32*)&tile_dst[m[2]] = (u32)CONV(srow[2]) | ((u32)CONV(srow[3]) << 16);    \
+        *(u32*)&tile_dst[m[4]] = (u32)CONV(srow[4]) | ((u32)CONV(srow[5]) << 16);    \
+        *(u32*)&tile_dst[m[6]] = (u32)CONV(srow[6]) | ((u32)CONV(srow[7]) << 16);
+
         for (int ty = 0; ty < tiles_y; ty++) {
             for (int tx = 0; tx < tiles_x; tx++) {
                 int src_tile_x = tx * 8;
                 int src_tile_y = (int)pot_h - 8 - ty * 8;
                 int tile_idx = ty * dst_tiles_x + dst_base_tx + tx;
                 texel_t* tile_dst = TILE_AT(tex_data, tile_idx);
-                if (lut16 && src_tile_x + 8 <= src->w &&
+                if (direct16 && src_tile_x + 8 <= src->w &&
                     src_tile_y >= 0 && src_tile_y + 8 <= src->h) {
                     for (int fy = 0; fy < 8; fy++) {
                         const u16* srow = px16 + (size_t)(src_tile_y + fy) * src->w + src_tile_x;
                         const u8* m = morton_lut[7 - fy];
-                        *(u32*)&tile_dst[m[0]] = (u32)lut16[srow[0]] | ((u32)lut16[srow[1]] << 16);
-                        *(u32*)&tile_dst[m[2]] = (u32)lut16[srow[2]] | ((u32)lut16[srow[3]] << 16);
-                        *(u32*)&tile_dst[m[4]] = (u32)lut16[srow[4]] | ((u32)lut16[srow[5]] << 16);
-                        *(u32*)&tile_dst[m[6]] = (u32)lut16[srow[6]] | ((u32)lut16[srow[7]] << 16);
+                        if (is4444) {
+                            CONV16_ROW(color16_4444_to_rgba)
+                        } else {
+                            CONV16_ROW(color16_direct_to_rgba)
+                        }
                     }
                     continue;
                 }
@@ -2159,13 +2049,13 @@ l8_done:
                 }
             }
         }
+#undef CONV16_ROW
     }
 
     const u64 flush_start_tick = svcGetSystemTick();
     pool_mark_slot_dirty(&texture_pool[slot_idx]); /* flush deferred to frame consumer */
     const u64 create_end_tick = svcGetSystemTick();
 
-pool_skip_build:
     entry->texture_index = tex_idx;
     entry->palette_index = pal_idx;
     entry->pool_slot = slot_idx;
@@ -2188,20 +2078,9 @@ pool_skip_build:
     { int slot_i = (int)(entry - gpu_cache); cache_hash_insert(tex_idx, pal_idx, slot_i); }
 
     cache_create_count_total++;
-    if (!gpu_cache_skip_full_build) {
-        cache_create_ticks_total += create_end_tick - create_start_tick;
-        cache_create_ticks_build += flush_start_tick - build_start_tick;
-        cache_create_ticks_flush += create_end_tick - flush_start_tick;
-        { /* Animation-stutter triage probe: one synchronous build taking
-           * >=4ms inside a frame is a stutter by itself. Silent otherwise. */
-            double ms = (double)(create_end_tick - create_start_tick) * 1000.0 / SYSCLOCK_ARM11;
-            if (ms >= 4.0) {
-                extern void debug_print(const char *fmt, ...);
-                debug_print("BUILDSPIKE %.1fms ti=%d %dx%d fmt=%d", ms, tex_idx,
-                            (int)pot_w, (int)pot_h, (int)src->fmt);
-            }
-        }
-    }
+    cache_create_ticks_total += create_end_tick - create_start_tick;
+    cache_create_ticks_build += flush_start_tick - build_start_tick;
+    cache_create_ticks_flush += create_end_tick - flush_start_tick;
     switch (src->fmt) {
     case SCE_GS_PSMT8:
         cache_create_count_psmt8++;
@@ -2814,6 +2693,11 @@ static bool white_tex_ready = false;
 
 #define BATCH_MAX_QUADS 1024
 
+/* Every drawable quad samples an atlas strip, a pool strip, or the untextured
+ * white texture, so this bounds the distinct textures the opaque re-batch can
+ * encounter. */
+#define OPAQUE_TEX_GROUP_MAX (ATLAS_MAX_STRIPS + POOL_STRIP_MAX + 1)
+
 typedef struct {
     float x, y, z;      // position
     float u, v;          // texcoord
@@ -3022,15 +2906,7 @@ static void batch_write_quad(int quad_idx,
     vp[3].u = u[3];  vp[3].v = v[3];
     vp[3].r = cr; vp[3].g = cg; vp[3].b = cb; vp[3].a = ca;
 
-    // 6 indices: two triangles (0,1,2) (1,3,2)
-    int ibase = quad_idx * 6;
-    u16 vb = (u16)vbase;
-    batch_idx_buf[ibase + 0] = vb;
-    batch_idx_buf[ibase + 1] = vb + 1;
-    batch_idx_buf[ibase + 2] = vb + 2;
-    batch_idx_buf[ibase + 3] = vb + 1;
-    batch_idx_buf[ibase + 4] = vb + 3;
-    batch_idx_buf[ibase + 5] = vb + 2;
+    /* Indices are constant per quad slot — written once at init. */
 }
 
 // ---------------------------------------------------------------------------
@@ -3064,6 +2940,20 @@ void SDLGameRenderer_Init(void) {
     batch_idx_buf = (u16*)linearAlloc(BATCH_MAX_QUADS * 6 * sizeof(u16));
     if (!batch_vtx_buf || !batch_idx_buf)
         printf("FATAL: batch buffer alloc failed!\n");
+
+    /* Quad N always uses vertices 4N..4N+3 in the same two-triangle order, so
+     * the whole index buffer is a constant. Fill and flush it once here rather
+     * than rewriting 6 indices per quad and re-flushing the range every frame —
+     * the GPU only ever reads what is already there. */
+    if (batch_idx_buf) {
+        for (int q = 0; q < BATCH_MAX_QUADS; q++) {
+            u16 vb = (u16)(q * 4);
+            u16* ip = &batch_idx_buf[q * 6];
+            ip[0] = vb;     ip[1] = vb + 1; ip[2] = vb + 2;
+            ip[3] = vb + 1; ip[4] = vb + 3; ip[5] = vb + 2;
+        }
+        GSPGPU_FlushDataCache(batch_idx_buf, BATCH_MAX_QUADS * 6 * sizeof(u16));
+    }
 
     raw_quad_vtx_buf = (BatchVertex*)linearAlloc(4 * sizeof(BatchVertex));
     raw_quad_idx_buf = (u16*)linearAlloc(6 * sizeof(u16));
@@ -3136,7 +3026,6 @@ void SDLGameRenderer_BeginFrame(void) {
     current_texture_index = -1;
     current_palette_index = -1;
     current_cache_entry = NULL;
-    frame_build_used = 0;
     if (imm_ready) imm_bind();
 }
 
@@ -3237,20 +3126,40 @@ void SDLGameRenderer_RenderFrame(void) {
         else transparent_list[transparent_n++] = p;
     }
 
-    /* Re-batch the opaque group by texture pointer alone (any grouping is
-     * correct — depth test resolves visibility regardless of order within
-     * or across texture groups). Simple insertion sort: opaque_n is at
-     * most a few hundred in the heaviest observed frames, so worst-case
-     * O(n²) is microseconds on this budget. */
-    for (int a = 1; a < opaque_n; a++) {
-        int key = opaque_list[a];
-        uintptr_t key_tex = (uintptr_t)pending_tex[key];
-        int b = a - 1;
-        while (b >= 0 && (uintptr_t)pending_tex[opaque_list[b]] > key_tex) {
-            opaque_list[b + 1] = opaque_list[b];
-            b--;
+    /* Re-batch the opaque group by texture (any grouping is correct — the
+     * depth test resolves visibility regardless of order within or across
+     * texture groups), preserving each texture's internal submission order.
+     * One bucketing pass into per-texture index chains: every quad's texture
+     * is one of the atlas or pool strips, so the group count is small and
+     * bounded, where the previous insertion sort cost grew quadratically
+     * with quad count — worst exactly on the heaviest frames. */
+    {
+        static C3D_Tex* grp_tex[OPAQUE_TEX_GROUP_MAX];
+        static int grp_head[OPAQUE_TEX_GROUP_MAX];
+        static int grp_tail[OPAQUE_TEX_GROUP_MAX];
+        static int grp_next[BATCH_MAX_QUADS];
+        int grp_n = 0;
+
+        for (int a = 0; a < opaque_n; a++) {
+            int p = opaque_list[a];
+            C3D_Tex* t = pending_tex[p];
+            int g = 0;
+            while (g < grp_n && grp_tex[g] != t) g++;
+            grp_next[p] = -1;
+            if (g == grp_n) {
+                grp_tex[g] = t;
+                grp_head[g] = p;
+                grp_n++;
+            } else {
+                grp_next[grp_tail[g]] = p;
+            }
+            grp_tail[g] = p;
         }
-        opaque_list[b + 1] = key;
+
+        int w = 0;
+        for (int g = 0; g < grp_n; g++)
+            for (int p = grp_head[g]; p >= 0; p = grp_next[p])
+                opaque_list[w++] = p;
     }
 
     C3D_Tex* quad_textures[BATCH_MAX_QUADS];
@@ -3276,7 +3185,6 @@ void SDLGameRenderer_RenderFrame(void) {
 
     // Flush vertex + index data from CPU cache so GPU can see it
     GSPGPU_FlushDataCache(batch_vtx_buf, quad_count * 4 * sizeof(BatchVertex));
-    GSPGPU_FlushDataCache(batch_idx_buf, quad_count * 6 * sizeof(u16));
 
     // --- Configure vertex buffer (replaces C3D_ImmDrawBegin attribute setup) ---
     C3D_BufInfo* bufInfo = C3D_GetBufInfo();
@@ -3362,7 +3270,11 @@ void SDLGameRenderer_RenderFrame(void) {
         pf_task_accum += render_task_count;
         pf_pool_accum += p_this;
         pf_frame++;
-        if (pf_frame % 8 == 0) { /* PORT DIAG: shortened from 120 for fast iteration. TEMP. */
+        /* Averaging window. The divisors below MUST match it — they were left
+         * at 120 when the window was shortened, under-reporting q/dc/p by 15x
+         * and over-reporting fps by the same. */
+        #define PF_WINDOW 8
+        if (pf_frame % PF_WINDOW == 0) {
             static u64 pf_last_tick = 0;
             static u64 pf_sort_prev = 0, pf_fill_prev = 0, pf_sub_prev = 0;
             static u64 pf_build_prev = 0;
@@ -3370,7 +3282,7 @@ void SDLGameRenderer_RenderFrame(void) {
             double pf_fps = 0;
             if (pf_last_tick > 0) {
                 double pf_ms = (double)(pf_now - pf_last_tick) * 1000.0 / SYSCLOCK_ARM11;
-                pf_fps = 120000.0 / pf_ms;
+                pf_fps = (double)PF_WINDOW * 1000.0 / pf_ms;
             }
             double sort_ms = (double)(render_ticks_sort - pf_sort_prev) * 1000.0 / SYSCLOCK_ARM11;
             double fill_ms = (double)(render_ticks_fill - pf_fill_prev) * 1000.0 / SYSCLOCK_ARM11;
@@ -3391,17 +3303,18 @@ void SDLGameRenderer_RenderFrame(void) {
               u32 d_create = settex_create - prev_stcreate;
               u32 d_fail = settex_fail - prev_stfail;
               u32 d_nopal = settex_nopal - prev_stnopal;
-              printf("rf: %.0ffps q=%u dc=%.1f p=%u | bld=%.0f",
-                     pf_fps,
-                     pf_quad_accum / 120,
-                     (double)(render_draw_call_count - pf_dc_accum) / 120.0,
-                     pf_pool_accum / 120,
-                     bld_ms);
-              if (d_miss || d_fail)
-                  printf(" ST m=%u c=%u f=%u np=%u", d_miss, d_create, d_fail, d_nopal);
-              if (d_noslot || d_texinit || d_evict)
-                  printf(" FAIL ns=%d ti=%d ev=%d", d_noslot, d_texinit, d_evict);
-              printf("\n");
+              /* debug_print, not printf: stdout goes nowhere on this target,
+               * so the printf form of these stats was never observable. */
+              extern void debug_print(const char *fmt, ...);
+              debug_print("rf: %.0ffps q=%u dc=%.1f p=%u | bld=%.0f"
+                          " ST m=%u c=%u f=%u np=%u FAIL ns=%d ti=%d ev=%d",
+                          pf_fps,
+                          pf_quad_accum / PF_WINDOW,
+                          (double)(render_draw_call_count - pf_dc_accum) / (double)PF_WINDOW,
+                          pf_pool_accum / PF_WINDOW,
+                          bld_ms,
+                          d_miss, d_create, d_fail, d_nopal,
+                          d_noslot, d_texinit, d_evict);
               prev_noslot = cache_fail_noslot;
               prev_texinit = cache_fail_texinit;
               prev_evict = (int)atlas_evictions_total;
@@ -3415,6 +3328,7 @@ void SDLGameRenderer_RenderFrame(void) {
             pf_quad_accum = 0; pf_task_accum = 0;
             pf_pool_accum = 0;
         }
+        #undef PF_WINDOW
     }
 #endif /* SF3_PERF_LOG */
 
@@ -4051,16 +3965,6 @@ void SDLGameRenderer_UnlockTexture(unsigned int th) {
                 texture_versions[ti]++;
                 unlock_texture_changed++;
                 cache_mark_texture_dirty(ti);
-#ifdef __3DS__
-                { static u32 _utc = 0;
-                  /* Print first few + every 500th for MTS 13 seqs pages (gix 1030+) */
-                  if (++_utc <= 5 || _utc % 500 == 1)
-                      printf("UNLOCK dirty ti=%d w=%d/%d h=%d/%d fmt=%d/%d px=%p/%p\n",
-                             ti, s->w, ft->width, s->h, ft->height,
-                             s->fmt, ft->format,
-                             (void*)s->pixels, (void*)pixels);
-                }
-#endif
             }
         }
     }

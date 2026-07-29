@@ -99,18 +99,6 @@ s32 Setup_Directory_Record_Data() {
                      "(then relaunch -- press START to exit)");
     }
 
-    /* 3DS: blocking pre-logo load — hold "PREPARE TO STRIKE" until the AFS
-     * preloader finishes, so the CAPCOM logo starts with a quiet disk. Once
-     * per boot (afsInit is idempotent; re-entries keep the warm cache). */
-    {
-        extern void bootLoadingScreen(void);
-        static u8 boot_load_done = 0;
-        if (!boot_load_done) {
-            boot_load_done = 1;
-            bootLoadingScreen();
-        }
-    }
-
     /*
     DskDrvErrBe = 0;
     DskDrvErrType = 0xFFFF;
@@ -321,21 +309,6 @@ s32 load_it_use_this_key(u16 fnum, s16 key) {
     Set_size_data_ramcnt_key(key, req.size);
 
     return err;
-}
-
-/* True while any load request is queued — the AFS boot preloader (afs.c
- * afsPreloadPump) checks this so it never steals the I/O thread from a real
- * load, which would push that load onto the blocking sync path. */
-s32 LDREQ_Queue_Busy(void) {
-    s16 i;
-
-    for (i = 0; i < (s16)(sizeof(q_ldreq) / sizeof(REQ)); i++) {
-        if (q_ldreq[i].be) {
-            return 1;
-        }
-    }
-
-    return 0;
 }
 
 void Init_Load_Request_Queue_1st() {

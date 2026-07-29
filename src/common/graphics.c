@@ -385,26 +385,6 @@ void showLoadingMessage(const char *msg) {
     draw_message_frame(msg);
 }
 
-/* Blocking boot loading screen (user plan, point 1 — hard version): hold a
- * black "PREPARE TO STRIKE" screen until the AFS boot preloader has pulled
- * every known one-shot monster file into the read cache, so the CAPCOM logo
- * and the rest of the boot flow run with a quiet disk. Called right after
- * afsInit at boot (GD3rd.c Setup_Directory_Record_Data). The 45s cap is a
- * safety net for a dead/slow SD — the game proceeds regardless. */
-void bootLoadingScreen(void) {
-    extern s32 afsPreloadDone(void);
-    extern void afsPreloadPump(void);
-    u64 start = svcGetSystemTick();
-
-    while (!afsPreloadDone()) {
-        showLoadingMessage("PREPARE TO STRIKE");
-        afsPreloadPump();
-        svcSleepThread(2 * 1000 * 1000LL); /* 2ms — let the I/O thread run */
-        if ((svcGetSystemTick() - start) > (u64)45 * SYSCLOCK_ARM11)
-            break;
-    }
-}
-
 void fatalMessage(const char *msg) {
     /* A readable error beats a silent black-screen hang (the old while(1)).
      * Keep aptMainLoop running so HOME works; START exits to the launcher. */
@@ -505,20 +485,6 @@ void startFrame() {
         last_start = now;
     }
 #endif
-
-    { /* Animation-stutter triage probe: total melt-decode time last frame.
-       * Prints ONLY when a single frame spent >=4ms decoding — silent in
-       * steady state, so it can stay in release builds. */
-        extern u64 g_melt_frame_ticks;
-        if (g_melt_frame_ticks) {
-            double ms = (double)g_melt_frame_ticks * 1000.0 / SYSCLOCK_ARM11;
-            if (ms >= 4.0) {
-                extern void debug_print(const char *fmt, ...);
-                debug_print("MELTSPIKE %.1fms", ms);
-            }
-            g_melt_frame_ticks = 0;
-        }
-    }
 
     setupScaling(render_mode);
     pspshim_gu_frame_reset();
