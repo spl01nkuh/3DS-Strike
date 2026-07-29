@@ -1,0 +1,1894 @@
+#include "psp/PPGFile.h"
+#include "common.h"
+#include "common/graphics.h"
+#include "ctr/ctr_game_renderer.h"
+
+#include "AcrSDK/common/plcommon.h"
+/*
+#include "sf33rd/AcrSDK/ps2/flps2asm.h"
+#include "sf33rd/AcrSDK/ps2/flps2render.h"
+#include "sf33rd/AcrSDK/ps2/flps2vram.h"
+#include "sf33rd/AcrSDK/ps2/foundaps2.h"
+*/
+#include "Game/color3rd.h"
+#include "fl.h"
+
+#include "psp/MemMan.h"
+#include "Compress/Lz77/Lz77Dec.h"
+#include "Compress/zlibApp.h"
+//#include "sf33rd/Source/PS2/ps2Quad.h"
+#include "structs.h"
+#include <malloc.h>
+#include <string.h>
+
+#define MAGIC_TO_INT(str) ((str[0] << 0x18) | (str[1] << 0x10) | (str[2] << 0x8) | (str[3]))
+#define REVERT_U32(val)                                                                                                \
+    (((val & 0xFF) << 0x18) | ((val & 0xFF00) << 8) | ((val >> 8) & 0xFF00) | ((val >> 0x18) & 0xFF))
+#define REVERT_U16(val) (((val >> 8) & 0xFF) | ((val & 0xFF) << 8))
+#define REVERT_U8(val) (((val << 4) & 0xF0) | ((val >> 4) & 0xF))
+
+/* Outer parens are required: callers use `CODE_0(code) * 2` (16-bit tiles),
+ * and without them only the second term was doubled (precedence: * binds
+ * tighter than +) -> wrong byte offset for 16-bit melt notifies. */
+#define CODE_0(val) (((val & 0xF0) << 8) + ((val & 0xF) << 4))
+#define CODE_1(val) (((val & 0x38) << 0xA) + ((val & 7) << 5))
+
+void* currentTexture = NULL;
+s32 currentPalette = -1;
+
+void ppgResetTextureCache(void) {
+    currentTexture = NULL;
+    currentPalette = -1;
+}
+
+typedef struct {
+    Vec3 v;
+    TexCoord t;
+} _Vertex;
+
+const u8 pplColorModeWidth[4] = { 0xF, 0x3F, 0xFF, 0 };
+
+PPG_W ppg_w;
+s16* dctex_linear;
+
+
+s32 ppgCheckPaletteDataBe(Palette* pch);
+void ppgWriteQuadOnly(Vertex* pos, u32 col, u32 texCode);
+void ppgWriteQuadOnly2(Vertex* pos, u32 col, u32 texCode);
+void ppgChangeDataEndian(u8* adrs, s32 size, s32 dendL, s32 col4, s32 depth, s32 excdot);
+void ppgSetupContextFromPPL(PPLFileHeader* ppl, plContext* bits);
+void ppgSetupContextFromPPG(PPGFileHeader* ppg, plContext* bits);
+
+void ppg_Initialize(void* lcmAdrs, s32 lcmSize) {
+    if (lcmAdrs == NULL) {
+        while (1) {}
+    }
+
+    mmHeapInitialize(&ppg_w.mm, lcmAdrs, lcmSize, ALIGN_UP(sizeof(_MEMMAN_CELL), 16), "- for PPG -");
+}
+
+void* ppgMallocF(s32 size) {
+    return mmAlloc(&ppg_w.mm, size, 0);
+}
+
+void* ppgMallocR(s32 size) {
+    return mmAlloc(&ppg_w.mm, size, 1);
+}
+
+void ppgFree(void* adrs) {
+    mmFree(&ppg_w.mm, adrs);
+}
+
+void* ppgPullDecBuff(s32 size) {
+    return ppgMallocR(size);
+}
+
+void ppgPushDecBuff(void* adrs) {
+    ppgFree(adrs);
+}
+
+void ppgTexSrcDataReleased(Texture* tex) {
+    if (tex == NULL) {
+        tex = ppg_w.cur->tex;
+    }
+
+    tex->srcAdrs = NULL;
+    tex->srcSize = 0;
+    ppgCheckTextureDataBe(tex);
+}
+
+void ppgPalSrcDataReleased(Palette* pal) {
+    if (pal == NULL) {
+        pal = ppg_w.cur->pal;
+    }
+
+    pal->srcAdrs = NULL;
+    pal->srcSize = 0;
+    ppgCheckPaletteDataBe(pal);
+}
+
+void ppgSourceDataReleased(PPGDataList* dlist) {
+    if (dlist == NULL) {
+        dlist = ppg_w.cur;
+    }
+
+    if (dlist->tex != NULL) {
+        ppgTexSrcDataReleased(dlist->tex);
+    }
+
+    if (dlist->pal != NULL) {
+        ppgPalSrcDataReleased(dlist->pal);
+    }
+}
+
+void ppgSetupCurrentDataList(PPGDataList* dlist) {
+    ppg_w.cur = dlist;
+}
+
+/* 3DS prewarm support: njReLoadTexturePartNumG uploads through ppg_w.cur —
+ * the background prewarm (MTRANS.c) must set the target group's list and
+ * restore the game's current one afterward, or its uploads land in whatever
+ * group the game happened to have current (== the sprite-corruption bug). */
+void* ppgGetCurrentDataListPtr(void) {
+    return (void*)ppg_w.cur;
+}
+void ppgSetCurrentDataListPtr(void* p) {
+    ppg_w.cur = (PPGDataList*)p;
+}
+
+void ppgSetupCurrentPaletteNumber(Palette* pal, s32 num) {
+    if (pal == NULL) {
+        pal = ppg_w.cur->pal;
+
+        if (pal == NULL) {
+            return;
+        }
+    }
+
+    if (num < pal->total) {
+        ppg_w.hanPal = pal->handle[num];
+    }
+}
+
+s32 ppgWriteQuadWithST_A(Vertex* pos, u32 col) {
+    ppgWriteQuadOnly(pos, col, ppg_w.hanTex | (ppg_w.hanPal << 0x10));
+    return 1;
+}
+
+s32 ppgWriteQuadWithST_A2(Vertex* pos, u32 col) {
+    ppgWriteQuadOnly2(pos, col, ppg_w.hanTex | (ppg_w.hanPal << 0x10));
+    return 1;
+}
+
+/* Native-renderer melt/tile notify (ported from the reference build): tells
+ * the renderer which pixel region of a texture just changed so only that
+ * rect is re-uploaded. */
+int ppg_skip_region_notify = 0;
+u32 ppg_region_update_count = 0;
+
+void ppgNotifyTextureRegionUpdate(u32 texture_handle, u32 code, u32 size) {
+    ppg_region_update_count++;
+    if (ppg_skip_region_notify) return;
+
+    if (texture_handle == 0 || texture_handle > FL_TEXTURE_MAX) {
+        return;
+    }
+
+    FLTexture* tex = &flTexture[texture_handle - 1];
+    if (!tex->be_flag || tex->width <= 0) {
+        return;
+    }
+
+    int bytes_per_pixel = 0;
+    int region_w = 0;
+    int region_h = 0;
+    int byte_offset = 0;
+
+    switch (size) {
+    case 0x40:
+        bytes_per_pixel = 1;
+        region_w = region_h = 8;
+        byte_offset = CODE_0(code);
+        break;
+    case 0x100:
+        bytes_per_pixel = 1;
+        region_w = region_h = 16;
+        byte_offset = CODE_0(code);
+        break;
+    case 0x400:
+        bytes_per_pixel = 1;
+        region_w = region_h = 32;
+        byte_offset = CODE_1(code);
+        break;
+    case 0x80:
+        bytes_per_pixel = 2;
+        region_w = region_h = 8;
+        byte_offset = CODE_0(code) * 2;
+        break;
+    case 0x200:
+        bytes_per_pixel = 2;
+        region_w = region_h = 16;
+        byte_offset = CODE_0(code) * 2;
+        break;
+    case 0x800:
+        bytes_per_pixel = 2;
+        region_w = region_h = 32;
+        byte_offset = CODE_1(code) * 2;
+        break;
+    default:
+        return;
+    }
+
+    int pixel_offset = byte_offset / bytes_per_pixel;
+    int x = pixel_offset % tex->width;
+    int y = pixel_offset / tex->width;
+    SDLGameRenderer_UpdateTextureRegion(texture_handle, x, y, region_w, region_h);
+}
+
+void ppgWriteQuadOnly(Vertex* pos, u32 col, u32 texCode) {
+    Sprite prm;
+    s32 i;
+
+    flSetRenderState(FLRENDER_TEXSTAGE0, texCode);
+
+    for (i = 0; i < 4; i++) {
+        prm.v[i].x = pos[i].x;
+        prm.v[i].y = pos[i].y;
+        prm.v[i].z = pos[i].z;
+        prm.t[i].s = pos[i].u;
+        prm.t[i].t = pos[i].v;
+    }
+
+    SDLGameRenderer_DrawTexturedQuad(&prm, col);
+}
+
+void ppgWriteQuadOnly2(Vertex* pos, u32 col, u32 texCode) {
+    Sprite prm;
+
+    flSetRenderState(FLRENDER_TEXSTAGE0, texCode);
+
+    prm.v[0].x = pos[0].x;
+    prm.v[0].y = pos[0].y;
+    prm.v[0].z = pos[0].z;
+    prm.t[0].s = pos[0].u;
+    prm.t[0].t = pos[0].v;
+    prm.v[3].x = pos[3].x;
+    prm.v[3].y = pos[3].y;
+    prm.v[3].z = pos[3].z;
+    prm.t[3].s = pos[3].u;
+    prm.t[3].t = pos[3].v;
+
+    SDLGameRenderer_DrawSprite(&prm, col);
+}
+
+void ppgWriteQuadOnly2T(Vertex* pos, u32 col, u32 texCode, TextureVertex *vertices) {
+
+    if(DEMMA_DEBUG || skip_frame)
+        return;
+
+    //quadOnly2DrawLast(texCode);
+
+    int texture_handle = LO_16_BITS(texCode) - 1;
+    FLTexture *tex = &flTexture[texture_handle];
+    s32 i;
+
+    f32 w_f = (float) tex->width;
+    f32 h_f = (float) tex->height;
+
+    #ifdef SCALE_WITH_VFPU
+    __asm__ volatile (
+        "mtv %4, S000\n"    // load vert->x to matrix
+        "mtv %5, S001\n"    // load vert->y to matrix
+        "mtv %6, S002\n"    // load vert->x to matrix
+        "mtv %7, S003\n"    // load vert->y to matrix
+
+        "vmul.q C000, C000, C410\n" // multiply matrix (scale)
+        "vadd.q C000, C000, C420\n" // add matrix (offset)
+
+        "mfv %0, S000\n"    // store in verticex->x
+        "mfv %1, S001\n"    // store in verticex->y
+        "mfv %2, S002\n"    // store in verticex->x
+        "mfv %3, S003\n"    // store in verticex->y
+        : "=r"(vertices[0].x), "=r"(vertices[0].y), "=r"(vertices[1].x), "=r"(vertices[1].y)
+        // %0 = vertices->x, %1 = vertices->y;
+        : "r"(pos[0].x), "r"(pos[0].y), "r"(pos[3].x), "r"(pos[3].y)
+        // %2 = vert->x, %3 = vert->y;
+    );
+    #else
+    vertices[0].x = SCALE_X(pos[0].x);
+    vertices[0].y = SCALE_Y(pos[0].y);
+
+    vertices[1].x = SCALE_X(pos[3].x);
+    vertices[1].y = SCALE_Y(pos[3].y);
+    #endif
+
+    vertices[0].z = pos[0].z;
+    vertices[0].u = pos[0].u * w_f;
+    vertices[0].v = pos[0].v * h_f;
+    vertices[0].colour = fixARGB(col);
+
+    vertices[1].z = pos[3].z;
+    vertices[1].u = pos[3].u * w_f;
+    vertices[1].v = pos[3].v * h_f;
+    vertices[1].colour = fixARGB(col);
+}
+
+
+void quadOnly2DrawLast(u32 texCode){
+}
+
+s32 ppgWriteQuadWithST_B(Vertex* pos, u32 col, PPGDataList* tb, s32 tix, s32 cix) {
+    u16 texhan;
+    u16 palhan = 0;
+
+    if (tb == NULL) {
+        tb = ppg_w.cur;
+
+        if (tb == NULL) {
+            return ppgWriteQuadWithST_A(pos, col);
+        }
+    }
+
+    if (tix < 0) {
+        texhan = ppg_w.hanTex;
+    } else {
+        texhan = tb->tex->handle[tix - tb->tex->ixNum1st].b16[0];
+
+        if (texhan == 0) {
+            return 0;
+        }
+    }
+
+    if (tb->tex->handle[tix - tb->tex->ixNum1st].b16[1] & 0x4000) {
+        if (cix < 0) {
+            palhan = ppg_w.hanPal;
+        } else {
+            palhan = tb->pal->handle[cix];
+        }
+    }
+
+    ppgWriteQuadOnly(pos, col, texhan | (palhan << 0x10));
+    return 1;
+}
+
+s32 ppgWriteQuadWithST_B2(Vertex* pos, u32 col, PPGDataList* tb, s32 tix, s32 cix) {
+    u16 texhan;
+    u16 palhan = 0;
+
+    if (tb == NULL) {
+        tb = ppg_w.cur;
+
+        if (tb == NULL) {
+            return ppgWriteQuadWithST_A2(pos, col);
+        }
+    }
+
+    if (tix < 0) {
+        texhan = ppg_w.hanTex;
+    } else {
+        texhan = tb->tex->handle[tix - tb->tex->ixNum1st].b16[0];
+
+        if (texhan == 0) {
+            return 0;
+        }
+    }
+
+    if (tb->tex->handle[tix - tb->tex->ixNum1st].b16[1] & 0x4000) {
+        if (cix < 0) {
+            palhan = ppg_w.hanPal;
+        } else {
+            palhan = tb->pal->handle[cix];
+        }
+    }
+
+    ppgWriteQuadOnly2(pos, col, texhan | (palhan << 16));
+    return 1;
+}
+
+s32 ppgWriteQuadUseTrans(Vertex* pos, u32 col, PPGDataList* tb, s32 tix, s32 cix, s32 flip, s32 pal) {
+    Vertex qvtx[4];
+    s32 i;
+    u32 sx;
+    u32 sy;
+    u32 ppgw;
+    u16* phan = NULL;
+    u16 palhan;
+    u16 texhan;
+    u8* tran;
+    u8 cofsXY;
+    u8 xs;
+    u8 ys;
+    u16 transTotal;
+    u16 iPoint;
+    u16 ix_ofs;
+    f32 pxs;
+    f32 pys;
+    f32 sadd;
+    f32 tadd;
+    f32 ppgwf, inv_ppgwf;
+    f32 ppghf, inv_ppghf;
+    PPGFileHeader* ppg;
+
+    //if ((pos[0].x >= 384.0f) || (pos[3].x < 0.0f) || (pos[0].y >= 224.0f) || (pos[3].y < 0.0f)) {
+    if ((pos[0].x >= Max_X) || (pos[3].x < Min_X) || (pos[0].y >= Max_Y) || (pos[3].y < Min_Y)) {
+        return 0;
+    }
+
+    if (tb == NULL) {
+        tb = ppg_w.cur;
+
+        if (tb == NULL) {
+            return ppgWriteQuadWithST_A2(pos, col);
+        }
+    }
+
+    texhan = tb->tex->handle[tix - tb->tex->ixNum1st].b16[0];
+    ix_ofs = tb->tex->handle[tix - tb->tex->ixNum1st].b16[1];
+
+    if (texhan == 0) {
+        return 0;
+    }
+
+    palhan = 0;
+
+    if (ix_ofs & 0x4000) {
+        phan = tb->pal->handle;
+
+        if (phan == NULL) {
+            return 0;
+        }
+    }
+
+    if (tb->tex->srcAdrs != NULL) {
+        ppg = (PPGFileHeader*)(tb->tex->srcAdrs + tb->tex->offset[ix_ofs & 0xFFF]);
+        transTotal = ((ppg->transNums >> 8) & 0xFF) | ((ppg->transNums & 0xFF) << 8);
+
+        if (transTotal != 0) {
+            tran = (u8*)&ppg[1];
+            ppgwf = ppg->width;
+            ppgw = ppg->width;
+            ppghf = ppg->height;
+            inv_ppgwf = 1 / ppgwf;
+            inv_ppghf = 1 / ppghf;
+            pxs = pos[3].x - pos[0].x;
+            pys = pos[3].y - pos[0].y;
+            /* NO half-texel UV correction here, deliberately diverging from
+             * the reference tree: with our shared-atlas cells packed edge to
+             * edge (no gutter texels), the reference's +sadd/-sadd shift
+             * pushes edge UVs past 1.0 and samples one texel into the
+             * NEIGHBORING cell — visible boxes/lines around attract-montage
+             * background tiles (user-confirmed regression when enabled). */
+            sadd = 0;
+            tadd = 0;
+
+            qvtx[0].z = pos[0].z;
+            qvtx[3].z = pos[3].z;
+
+            for (i = 0; i < transTotal; i++) {
+                if (ix_ofs & 0x4000) {
+                    palhan = phan[*tran + pal];
+                }
+
+                tran++;
+                iPoint = *tran++;
+                cofsXY = *tran++;
+                xs = (cofsXY >> 4) + 1;
+                ys = (cofsXY & 0xF) + 1;
+                sx = iPoint % ppgw;
+                sy = iPoint / ppgw;
+
+                if (flip & 1) {
+                    qvtx[3].x = pos->x + (pxs * (ppgw - sx) * inv_ppgwf);
+                    qvtx[0].x = pos->x + (pxs * (ppgw - (sx + xs)) * inv_ppgwf);
+                } else {
+                    qvtx[0].x = pos->x + (sx * pxs * inv_ppgwf);
+                    qvtx[3].x = pos->x + (pxs * (sx + xs) * inv_ppgwf);
+                }
+
+                if (flip & 2) {
+                    qvtx[3].y = pos->y + (pys * (ppgw - sy) * inv_ppghf);
+                    qvtx[0].y = pos->y + (pys * (ppgw - (sy + ys)) * inv_ppghf);
+                } else {
+                    qvtx[0].y = pos->y + (sy * pys * inv_ppghf);
+                    qvtx[3].y = pos->y + (pys * (sy + ys) * inv_ppghf);
+                }
+
+                //if ((qvtx[0].x < 384.0f) && (qvtx[3].x >= 0.0f) && (qvtx[0].y < 224.0f) && (qvtx[3].y >= 0.0f)) {
+                if ((qvtx[0].x < Max_X) && (qvtx[3].x >= Min_X) && (qvtx[0].y < Max_Y) && (qvtx[3].y >= Min_Y)) {
+                    if (flip & 1) {
+                        qvtx[3].u = (sx * inv_ppgwf) - sadd;
+                        qvtx[0].u = ((sx + xs) * inv_ppgwf) - sadd;
+                    } else {
+                        qvtx[0].u = sadd + (sx * inv_ppgwf);
+                        qvtx[3].u = sadd + ((sx + xs) * inv_ppgwf);
+                    }
+
+                    if (flip & 2) {
+                        qvtx[3].v = (sy * inv_ppghf) - tadd;
+                        qvtx[0].v = ((sy + ys) * inv_ppghf) - tadd;
+                    } else {
+                        qvtx[0].v = tadd + (sy * inv_ppghf);
+                        qvtx[3].v = tadd + ((sy + ys) * inv_ppghf);
+                    }
+
+                    ppgWriteQuadOnly2(qvtx, col, texhan | (palhan << 0x10));
+                }
+            }
+
+            return 1;
+        }
+    }
+
+    if (ix_ofs & 0x4000) {
+        if (cix < 0) {
+            palhan = ppg_w.hanPal;
+        } else {
+            palhan = phan[cix];
+        }
+    }
+
+    switch (flip) {
+    case 0:
+        pos[0].u = pos[0].v = 0.0f;
+        pos[3].u = pos[3].v = 1.0f;
+        break;
+
+    case 1:
+        pos[3].u = pos[0].v = 0.0f;
+        pos[0].u = pos[3].v = 1.0f;
+        break;
+
+    case 2:
+        pos[0].u = pos[3].v = 0.0f;
+        pos[3].u = pos[0].v = 1.0f;
+        break;
+
+    default:
+        pos[0].u = pos[0].v = 1.0f;
+        pos[3].u = pos[3].v = 0.0f;
+        break;
+    }
+
+    ppgWriteQuadOnly2(pos, col, texhan | (palhan << 0x10));
+    return 1;
+}
+
+ssize_t ppgDecompress(s32 koCmpr, void* srcAdrs, s32 srcSize, void* dstAdrs, s32 dstSize) {
+    u8* src;
+    u8* dst;
+    s32 i;
+    ssize_t rnum = 0;
+
+    switch (koCmpr) {
+    default:
+        if (srcAdrs != dstAdrs) {
+            flMemcpy(dstAdrs, srcAdrs, dstSize);
+        }
+
+        rnum = srcSize;
+        break;
+
+    case 1:
+        rnum = decLZ77withSizeCheck(srcAdrs, dstAdrs, dstSize);
+        rnum *= dstSize;
+        break;
+
+    case 2:
+        rnum = zlib_Decompress(srcAdrs, srcSize, dstAdrs, dstSize);
+        break;
+    }
+
+    return rnum;
+}
+
+s32 ppgSetupCmpChunk(u8* srcAdrs, s32 num, u8* dstAdrs) {
+    PPXFileHeader* ppx;
+    void* cmpAdrs;
+    s32 cmpSize;
+    s32 mltSize;
+    s32 koCmpr;
+    s32 ofs;
+
+    ofs = 0;
+
+    while (1) {
+        ppx = (PPXFileHeader*)(srcAdrs + ofs);
+
+        if (MAGIC_TO_INT("pEND") == REVERT_U32(ppx->magic)) {
+            return -1;
+        }
+
+        if (MAGIC_TO_INT("pCMP") != REVERT_U32(ppx->magic)) {
+            ofs += (REVERT_U32(ppx->fileSize) + 3) & ~3;
+            continue;
+        }
+
+        if (num > 0) {
+            num -= 1;
+            ofs += (REVERT_U32(ppx->fileSize) + 3) & ~3;
+            continue;
+        }
+
+        break;
+    }
+
+    mltSize = REVERT_U32(ppx->expSize);
+    cmpSize = REVERT_U32(ppx->fileSize) - 0x10;
+    cmpAdrs = ppx + 1;
+    koCmpr = ppx->compress & 3;
+
+    if (mltSize != ppgDecompress(koCmpr, cmpAdrs, cmpSize, dstAdrs, mltSize)) {
+        flLogOut("Failed to decompress the compressed data.\n"); // Failed to decompress the compressed data.
+        while (1) {}
+    }
+
+    return 1;
+}
+
+s32 ppgSetupPalChunk(Palette* pch, u8* adrs, s32 size, s32 ixNum1st, s32 num, s32 /* unused */) {
+    PPLFileHeader* ppl;
+    plContext bits;
+    s32 i;
+    s32 col_items;
+    s32 koCmpr;
+    s32 cmpSize;
+    s32 mltSize;
+    void* cmpAdrs;
+    void* mltAdrs;
+    u32 ofs = 0;
+
+    if (pch == NULL) {
+        pch = ppg_w.cur->pal;
+    }
+
+    if (pch->be) {
+        while (1) {}
+    }
+
+    pch->be = 0;
+    pch->ixNum1st = ixNum1st;
+    pch->srcAdrs = adrs;
+    pch->srcSize = size;
+    pch->handle = NULL;
+    mltAdrs = NULL;
+    koCmpr = 0;
+
+    while (1) {
+        ppl = (PPLFileHeader*)(adrs + ofs);
+
+        if (MAGIC_TO_INT("pEND") == REVERT_U32(ppl->magic)) {
+            return -1;
+        }
+
+        if (MAGIC_TO_INT("pPAL") != REVERT_U32(ppl->magic)) {
+            ofs += (REVERT_U32(ppl->fileSize) + 3) & ~3;
+            continue;
+        }
+
+        if (num > 0) {
+            num -= 1;
+            ofs += (REVERT_U32(ppl->fileSize) + 3) & ~3;
+            continue;
+        }
+
+        break;
+    }
+
+    cmpSize = REVERT_U32(ppl->fileSize) - 16;
+    cmpAdrs = ppl + 1;
+    pch->c_mode = ppl->c_mode & 3;
+    pch->total = REVERT_U16(ppl->palettes);
+    col_items = pplColorModeWidth[pch->c_mode] + 1;
+    koCmpr = ppl->compress & 3;
+    ppgSetupContextFromPPL(ppl, &bits);
+    pch->handle = ppgMallocF(pch->total * 2);
+
+    if (pch->handle != NULL) {
+        for (i = 0; i < pch->total; i++) {
+            pch->handle[i] = 0;
+        }
+
+        mltSize = bits.bitdepth * (pch->total * col_items);
+
+        if (koCmpr != 0) {
+            mltAdrs = ppgPullDecBuff(mltSize);
+        } else {
+            mltAdrs = cmpAdrs;
+        }
+
+        if (mltAdrs == NULL) {
+            // Failed to allocate palette data decompression area.
+            flLogOut("Failed to allocate palette data decompression area.\n");
+            goto error_handler;
+        }
+
+        if (mltSize != ppgDecompress(koCmpr, cmpAdrs, cmpSize, mltAdrs, mltSize)) {
+            flLogOut("Failed to decompress the palette data.\n"); // Failed to decompress the palette data.
+            ppgPushDecBuff(mltAdrs);
+            goto error_handler;
+        }
+
+        ppgChangeDataEndian(mltAdrs, mltSize, ppl->c_mode & 4, ppl->formARGB == 0x8888, bits.bitdepth, 0);
+
+        if (koCmpr == 0) {
+            ppl->c_mode |= 4;
+        }
+
+        bits.ptr = mltAdrs;
+
+        for (i = 0; i < pch->total; i++) {
+            pch->handle[i] = flCreatePaletteHandle(&bits, 0);
+            //pch->handle[i] = ColorRAM[ixNum1st + i];
+            //pch->handle[i] = ixNum1st + i;
+            
+            if (pch->handle[i] == -1) {
+                flLogOut("Failed to acquire palette handle.\n"); // Failed to acquire palette handle.
+
+                if (koCmpr == 0) {
+                    goto error_handler;
+                }
+
+                ppgPushDecBuff(mltAdrs);
+                goto error_handler;
+            }
+
+            bits.ptr = (u8*)bits.ptr + (col_items * bits.bitdepth);
+        }
+
+        if (koCmpr != 0) {
+            ppgPushDecBuff(mltAdrs);
+        }
+        pch->be = 1;
+        return 1;
+    }
+
+error_handler:
+    if (pch->handle != NULL) {
+        for (i = 0; i < pch->total; i++) {
+            if (pch->handle[i]) {
+                flReleasePaletteHandle(pch->handle[i]);
+            }
+        }
+
+        ppgFree(pch->handle);
+    }
+
+    if ((koCmpr != 0) && (mltAdrs != NULL)) {
+        ppgPushDecBuff(mltAdrs);
+    }
+
+    pch->handle = NULL;
+    while (1) {}
+}
+
+s32 ppgSetupPalChunkDir(Palette* pch, PPLFileHeader* ppl, u8* adrs, s32 ixNum1st, s32 /* unused */) {
+    plContext bits;
+    s32 i;
+
+    if (pch == NULL) {
+        pch = ppg_w.cur->pal;
+    }
+
+    if (pch->be) {
+        while (1) {}
+    }
+
+    pch->be = 0;
+    pch->ixNum1st = ixNum1st;
+    pch->srcAdrs = NULL;
+    pch->c_mode = ppl->c_mode & 3;
+    ppgSetupContextFromPPL(ppl, &bits);
+    pch->srcSize = bits.pitch * bits.height;
+    pch->total = REVERT_U16(ppl->palettes);
+    pch->handle = ppgMallocF(pch->total * 2);
+
+    if (pch->handle != NULL) {
+        for (i = 0; i < pch->total; i++) {
+            pch->handle[i] = 0;
+        }
+
+        ppgChangeDataEndian(
+            adrs, pch->total * (bits.pitch * bits.height), ppl->c_mode & 4, ppl->formARGB == 0x8888, bits.bitdepth, 0);
+        ppl->c_mode |= 4;
+
+        for (i = 0; i < pch->total; i++) {
+            bits.ptr = adrs;
+            pch->handle[i] = flCreatePaletteHandle(&bits, 0);
+            //pch->handle[i] = ixNum1st + i;
+            
+            if (pch->handle[i] == -1) {
+                goto error_handler;
+            }
+
+            adrs = &adrs[pch->srcSize];
+        }
+
+        pch->be = 1;
+        return 1;
+    }
+
+error_handler:
+    if (pch->handle != NULL) {
+        for (i = 0; i < pch->total; i++) {
+            if (pch->handle[i]) {
+                flReleasePaletteHandle(pch->handle[i]);
+            }
+        }
+
+        ppgFree(pch->handle);
+    }
+
+    pch->handle = NULL;
+    flLogOut("Failed to acquire palette handle. ( dir )\n"); // Failed to acquire palette handle. (dir)
+    while (1) {}
+}
+
+void ppgChangeDataEndian(u8* adrs, s32 size, s32 dendL, s32 col4, s32 depth, s32 excdot) {
+    s32 i;
+    u32* c4;
+
+    if (depth == 1) {
+        return;
+    }
+
+    if (depth != 0) {
+        if (dendL == 0) {
+            c4 = (u32*)adrs;
+            if (col4 != 0) {
+                for (i = 0; i < size / 4; i++) {
+                    u32 v = c4[i];
+                    c4[i] = ((v & 0xFF) << 24) | ((v & 0xFF00) << 8) | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF);
+                }
+            } else {
+                // Byte-swap pairs of u16 via u32: process 2 pixels per iteration
+                for (i = 0; i < size / 4; i++) {
+                    u32 v = c4[i];
+                    c4[i] = ((v >> 8) & 0x00FF00FF) | ((v << 8) & 0xFF00FF00);
+                }
+            }
+        }
+
+        return;
+    }
+
+    if (excdot != 0) {
+        // Nibble-swap bytes: process 4 at a time via u32
+        c4 = (u32*)adrs;
+        for (i = 0; i < size / 4; i++) {
+            u32 v = c4[i];
+            c4[i] = ((v << 4) & 0xF0F0F0F0) | ((v >> 4) & 0x0F0F0F0F);
+        }
+    }
+}
+
+s32 ppgSetupTexChunkSeqs(Texture* tch, PPGFileHeader* ppg, u8* adrs, s32 ixNum1st, s32 ixNums, u32 attribute) {
+    plContext bits;
+    s32 i;
+    s32 ci_flag = 0;
+
+    if (tch == NULL) {
+        tch = ppg_w.cur->tex;
+    }
+
+    if (tch->be) {
+        while (1) {}
+    }
+
+    tch->be = 0;
+    tch->textures = ixNums;
+    tch->accnum = ixNums;
+    tch->ixNum1st = ixNum1st;
+    tch->total = ixNums;
+    tch->flags = 0x80;
+    tch->arCnt = 0;
+    tch->arInit = 0;
+    tch->handle = NULL;
+    tch->offset = NULL;
+    tch->srcAdrs = NULL;
+    tch->srcSize = 0;
+    tch->handle = ppgMallocF(ixNums * 4);
+
+    if (tch->handle == NULL) {
+        flLogOut("Failed to allocate texture handle memory. \n"); // Failed to allocate texture handle memory.
+        while (1) {}
+    }
+
+    for (i = 0; i < ixNums; i++) {
+        tch->handle[i].b16[0] = 0;
+        tch->handle[i].b16[1] = 0x8000;
+    }
+
+    ppgSetupContextFromPPG(ppg, &bits);
+    tch->srcAdrs = adrs;
+    tch->srcSize = bits.pitch * bits.height;
+
+    memset(adrs, 0, tch->srcSize * ixNums);
+
+    if (bits.bitdepth < 2) {
+        ci_flag = 0x4000;
+    }
+
+    for (i = 0; i < ixNums; i++) {
+        bits.ptr = adrs;
+        tch->handle[i].b16[1] = ci_flag;
+        tch->handle[i].b16[0] = flCreateTextureHandle(&bits, attribute, 0);
+
+        if (tch->handle[i].b16[0] == -1) {
+            goto error_handler;
+        }
+
+        adrs += tch->srcSize;
+    }
+
+    tch->be = 1;
+    return 1;
+
+error_handler:
+    for (i = 0; i < ixNums; i++) {
+        if (tch->handle[i].b16[0]) {
+            flReleaseTextureHandle(tch->handle[i].b16[0]);
+        }
+    }
+
+    ppgFree(tch->handle);
+    tch->handle = NULL;
+    flLogOut("Failed to acquire sprite texture handle.\n"); // Failed to acquire sprite texture handle.
+    while (1) {}
+}
+
+/* DIAG: measure whether melt-decompressed tiles come out uniform/all-zero
+ * (empty), broken down by texture group (gix). Result (2026-06-28): melt is
+ * HEALTHY — 20480 tiles, zero empty, ~3.5% uniform (legit solid regions). Off.
+ * Now also: detect wkVram churn in the publish (ppgRenewTexChunkSeqs).
+ * Result: WKMOVE=0 — buffers are stable, no address churn.
+ * Result: failing content is NOT in any melt chunk (DRAWUNI buffers 0x91x-0x95x
+ * vs melt chunks 0x83x-0x86x) — banners/super are empty mem_handle textures the
+ * melt never fills. Off. */
+#define MELT_DIAG 0
+
+/* Live-mirror destination for a melt tile. Melt offsets are 256-wide PAGE
+ * space; the live texture may be a SUB-PAGE sheet (this tree re-chunks some
+ * PSP data into 128x128 — the reference tree never has those), so the page
+ * (x,y) must be remapped to the live sheet's own stride and bounds-checked
+ * per tile. Writing page offsets straight into a smaller buffer overflowed
+ * the heap (observed: menu BGM dying after scene transitions) while half-
+ * fixing the sky. Returns NULL (skip mirror) when the tile falls outside.
+ * adv = live row advance after `tile` texel writes. */
+static inline u8* melt_live_dst8(u8* base, s32 lw, s32 lh, u32 off, s32 tile, s32* adv) {
+    if (!base || lw <= 0) return NULL;
+    s32 x = (s32)(off & 0xFF), y = (s32)(off >> 8);
+    if (x + tile > lw || y + tile > lh) return NULL;
+    *adv = lw - tile;
+    return base + (size_t)y * lw + x;
+}
+static inline u16* melt_live_dst16(u8* base, s32 lw, s32 lh, u32 off, s32 tile, s32* adv) {
+    if (!base || lw <= 0) return NULL;
+    s32 x = (s32)(off & 0xFF), y = (s32)(off >> 8);
+    if (x + tile > lw || y + tile > lh) return NULL;
+    *adv = lw - tile;
+    return (u16*)base + (size_t)y * lw + x;
+}
+
+void ppgRenewDotDataSeqs(u32 gix, u32* srcRam, u32 code, u32 size) {
+    s32 ix;
+    s32 i;
+    s32 j;
+    u16* dstRam16;
+    u16* srcRam16;
+    u16* tix;
+    u8* dstRam8;
+    u8* srcRam8;
+    u16* idx;
+    u8* liveBase;
+    u8* dstRam8Live;
+    u16* dstRam16Live;
+    s32 live_w, live_h;
+    s32 liveAdv = 0;
+
+    Texture *tch = ppg_w.cur->tex;
+
+    if (tch->be != 0) {
+        ix = gix - tch->ixNum1st;
+
+        if ((ix < 0) || (ix >= tch->total)) {
+            return;
+        }
+
+        if (tch->handle[ix].b16[0] != 0) {
+            tch->handle[ix].b16[1] |= 0x2000;
+
+            /* ★ Mirror melt writes into the texture's system-memory buffer
+             * (matches friend_build's "liveBase" path). For mode=0 seqs
+             * sheets this buffer ALIASES the srcAdrs slice below (mirror is
+             * redundant but harmless); for other modes — stage/OB sheets —
+             * the renderer reads THIS buffer, and without the mirror the
+             * melted (animated) tiles never reach it. Measured: Ibuki-stage
+             * sky dashes = exactly the melted tiles showing stale bytes,
+             * palette-independent, unaffected by every renderer-side fix. */
+            liveBase = NULL;
+            live_w = live_h = 0;
+            if (tch->handle[ix].b16[0] <= FL_TEXTURE_MAX) {
+                FLTexture* liveTexture = &flTexture[tch->handle[ix].b16[0] - 1];
+                if (liveTexture->be_flag && liveTexture->mem_handle != 0) {
+                    u8* lb = (u8*)flPS2GetSystemBuffAdrs(liveTexture->mem_handle);
+                    u8* slice = (u8*)(tch->srcAdrs + tch->srcSize * ix);
+                    if (lb && lb != slice) {
+                        liveBase = lb;
+                        live_w = liveTexture->width;
+                        live_h = liveTexture->height;
+                    }
+                }
+            }
+
+#if MELT_DIAG
+            { /* log distinct melt chunk address ranges so a DRAWUNI tex_ptr can be
+               * checked against them: is the blob's buffer a melt chunk or not? */
+                static const void *seen[24]; static int ns;
+                const void *ca = tch->srcAdrs;
+                int dup = 0;
+                for (int k = 0; k < ns; k++) if (seen[k] == ca) { dup = 1; break; }
+                if (!dup && ns < 24) { seen[ns++] = ca;
+                    extern void debug_print(const char *fmt, ...);
+                    debug_print("MELTCHUNK srcAdrs=%p end=%p srcSize=%lX total=%ld",
+                                ca, (const void *)((const u8 *)ca + tch->srcSize * tch->total),
+                                (unsigned long)tch->srcSize, (long)tch->total);
+                }
+            }
+#endif
+
+            switch (size) {
+            case 0x40:
+                srcRam8 = (u8*)srcRam;
+                dstRam8 = (u8*)(tch->srcAdrs + tch->srcSize * ix + CODE_0(code));
+                dstRam8Live = melt_live_dst8(liveBase, live_w, live_h, CODE_0(code), 8, &liveAdv);
+
+                /* 4 gathered texels per u32 store (dst rows are 4-byte
+                 * aligned: tile offsets are multiples of 16 texels). Halves
+                 * the store traffic of the melt's hottest copy. */
+                for (i = 0; i < 8; i++) {
+                    idx = &dctex_linear[i << 5];
+                    for (j = 0; j < 8; j += 4) {
+                        u32 v = (u32)srcRam8[idx[0]] | ((u32)srcRam8[idx[1]] << 8) |
+                                ((u32)srcRam8[idx[2]] << 16) | ((u32)srcRam8[idx[3]] << 24);
+                        idx += 4;
+                        *(u32*)dstRam8 = v; dstRam8 += 4;
+                        if (dstRam8Live) { *(u32*)dstRam8Live = v; dstRam8Live += 4; }
+                    }
+
+                    dstRam8 += 0xF8;
+                    if (dstRam8Live) dstRam8Live += liveAdv;
+                }
+
+                break;
+
+            case 0x100:
+                srcRam8 = (u8*)srcRam;
+                dstRam8 = (u8*)(tch->srcAdrs + tch->srcSize * ix + CODE_0(code));
+                dstRam8Live = melt_live_dst8(liveBase, live_w, live_h, CODE_0(code), 16, &liveAdv);
+
+                for (i = 0; i < 0x10; i++) {
+                    idx = &dctex_linear[i << 5];
+                    for (j = 0; j < 0x10; j += 4) {
+                        u32 v = (u32)srcRam8[idx[0]] | ((u32)srcRam8[idx[1]] << 8) |
+                                ((u32)srcRam8[idx[2]] << 16) | ((u32)srcRam8[idx[3]] << 24);
+                        idx += 4;
+                        *(u32*)dstRam8 = v; dstRam8 += 4;
+                        if (dstRam8Live) { *(u32*)dstRam8Live = v; dstRam8Live += 4; }
+                    }
+
+                    dstRam8 += 0xF0;
+                    if (dstRam8Live) dstRam8Live += liveAdv;
+                }
+
+                break;
+
+            case 0x400:
+                srcRam8 = (u8*)srcRam;
+                dstRam8 = (u8*)(tch->srcAdrs + tch->srcSize * ix + CODE_1(code));
+                dstRam8Live = melt_live_dst8(liveBase, live_w, live_h, CODE_1(code), 32, &liveAdv);
+                tix = (u16*)dctex_linear;
+
+                for (i = 0; i < 0x20; i++) {
+                    for (j = 0; j < 0x20; j += 4) {
+                        u32 v = (u32)srcRam8[tix[0]] | ((u32)srcRam8[tix[1]] << 8) |
+                                ((u32)srcRam8[tix[2]] << 16) | ((u32)srcRam8[tix[3]] << 24);
+                        tix += 4;
+                        *(u32*)dstRam8 = v; dstRam8 += 4;
+                        if (dstRam8Live) { *(u32*)dstRam8Live = v; dstRam8Live += 4; }
+                    }
+
+                    dstRam8 += 0xE0;
+                    if (dstRam8Live) dstRam8Live += liveAdv;
+                }
+
+                break;
+
+            case 0x80:
+                srcRam16 = (u16*)srcRam;
+                dstRam16 = (u16*)(tch->srcAdrs + tch->srcSize * ix + (CODE_0(code)) * 2);
+                dstRam16Live = melt_live_dst16(liveBase, live_w, live_h, CODE_0(code), 8, &liveAdv);
+
+                for (i = 0; i < 8; i++) {
+                    idx = &dctex_linear[i << 5];
+                    for (j = 0; j < 8; j += 2) {
+                        u32 v = (u32)srcRam16[idx[0]] | ((u32)srcRam16[idx[1]] << 16);
+                        idx += 2;
+                        *(u32*)dstRam16 = v; dstRam16 += 2;
+                        if (dstRam16Live) { *(u32*)dstRam16Live = v; dstRam16Live += 2; }
+                    }
+
+                    dstRam16 += 0xF8;
+                    if (dstRam16Live) dstRam16Live += liveAdv;
+                }
+
+                break;
+
+            case 0x200:
+                srcRam16 = (u16*)srcRam;
+                dstRam16 = (u16*)(tch->srcAdrs + tch->srcSize * ix + (CODE_0(code)) * 2);
+                dstRam16Live = melt_live_dst16(liveBase, live_w, live_h, CODE_0(code), 16, &liveAdv);
+
+                for (i = 0; i < 0x10; i++) {
+                    idx = &dctex_linear[i << 5];
+                    for (j = 0; j < 0x10; j += 2) {
+                        u32 v = (u32)srcRam16[idx[0]] | ((u32)srcRam16[idx[1]] << 16);
+                        idx += 2;
+                        *(u32*)dstRam16 = v; dstRam16 += 2;
+                        if (dstRam16Live) { *(u32*)dstRam16Live = v; dstRam16Live += 2; }
+                    }
+
+                    dstRam16 += 0xF0;
+                    if (dstRam16Live) dstRam16Live += liveAdv;
+                }
+
+                break;
+
+            case 0x800:
+                srcRam16 = (u16*)srcRam;
+                dstRam16 = (u16*)(tch->srcAdrs + tch->srcSize * ix + (CODE_1(code)) * 2);
+                dstRam16Live = melt_live_dst16(liveBase, live_w, live_h, CODE_1(code), 32, &liveAdv);
+                tix = (u16*)dctex_linear;
+
+                for (i = 0; i < 0x20; i++) {
+                    for (j = 0; j < 0x20; j += 2) {
+                        u32 v = (u32)srcRam16[tix[0]] | ((u32)srcRam16[tix[1]] << 16);
+                        tix += 2;
+                        *(u32*)dstRam16 = v; dstRam16 += 2;
+                        if (dstRam16Live) { *(u32*)dstRam16Live = v; dstRam16Live += 2; }
+                    }
+
+                    dstRam16 += 0xE0;
+                    if (dstRam16Live) dstRam16Live += liveAdv;
+                }
+
+                break;
+            }
+
+            /* Native renderer: notify which pixel region of this sheet the
+             * melt just wrote so only that rect re-uploads. MUST come AFTER
+             * the writes above (matches the reference tree) — the region
+             * update synchronously re-reads the source rect and rewrites the
+             * GPU tile, so notifying first uploads the PRE-melt bytes
+             * (uninitialized noise on fresh sheets) and the real content
+             * written just after is never picked up. */
+            ppgNotifyTextureRegionUpdate(tch->handle[ix].b16[0], code, size);
+        }
+    }
+}
+
+void ppgMakeConvTableTexDC() {
+    s16 seed[32] = {
+        0x0000, 0x0002, 0x0008, 0x000A, 0x0020, 0x0022, 0x0028, 0x002A, 0x0080, 0x0082, 0x0088,
+        0x008A, 0x00A0, 0x00A2, 0x00A8, 0x00AA, 0x0200, 0x0202, 0x0208, 0x020A, 0x0220, 0x0222,
+        0x0228, 0x022A, 0x0280, 0x0282, 0x0288, 0x028A, 0x02A0, 0x02A2, 0x02A8, 0x02AA,
+    };
+
+    s16 seedAdd[16] = {
+        0x0000, 0x0004, 0x0010, 0x0014, 0x0040, 0x0044, 0x0050, 0x0054,
+        0x0100, 0x0104, 0x0110, 0x0114, 0x0140, 0x0144, 0x0150, 0x0154,
+    };
+
+    s32 i;
+    s32 j;
+
+    for (i = 0; i < 16; i++) {
+        for (j = 0; j < 32; j++) {
+            dctex_linear[j + i * 64] = seed[j] + seedAdd[i];
+        }
+
+        for (j = 0; j < 32; j++) {
+            dctex_linear[j + (i * 64 + 32)] = dctex_linear[j + i * 64] + 1;
+        }
+    }
+}
+
+s32 fastLockTexture(u32 th, void** ptr) {
+    if (th > FL_TEXTURE_MAX) return 0;
+
+    FLTexture* tex = &flTexture[th - 1];
+    if (!tex->be_flag) return 0;
+
+    if (tex->mem_handle == 0) return 0;
+
+    *ptr = flPS2GetSystemBuffAdrs(tex->mem_handle);
+    return 1;
+}
+
+s32 ppgRenewTexChunkSeqs(Texture* tch) {
+    plContext bits;
+    s32 i;
+    s32* srcRam;
+    s32* dstRam;
+
+    if (tch == NULL) {
+        tch = ppg_w.cur->tex;
+
+        if (tch == NULL) {
+            return 0;
+        }
+    }
+
+    if (tch->be == 0) {
+        return 0;
+    }
+
+    void* dst;
+    FLTexture *tex;
+
+    /* Native renderer: melt writes were already delivered per-region by
+     * ppgNotifyTextureRegionUpdate at write time — this publish step only
+     * clears the dirty flags (matches the reference build; the old wkVram
+     * publish caused redundant full-texture rebuild churn). */
+    for (i = 0; i < tch->total; i++) {
+        if (tch->handle[i].b16[1] & 0x2000) {
+            tch->handle[i].b16[1] &= 0xDFFF;
+        }
+    }
+
+    return 1;
+}
+
+s32 ppgSetupTexChunk_1st(Texture* tch, u8* adrs, ssize_t size, s32 ixNum1st, s32 ixNums, s32 ar, s32 arcnt) {
+    PPGFileHeader* ppg;
+    s32 i;
+    s32 ofs;
+
+    if (tch == NULL) {
+        tch = ppg_w.cur->tex;
+    }
+
+    if (tch->be) {
+        while (1) {}
+    }
+
+    tch->be = 0;
+    tch->textures = 0;
+    tch->accnum = 0;
+    tch->ixNum1st = ixNum1st;
+    tch->total = ixNums;
+    tch->flags = ar != 0;
+    tch->arCnt = 0;
+    tch->arInit = arcnt;
+    tch->offset = NULL;
+    tch->srcAdrs = adrs;
+    tch->srcSize = size;
+    tch->handle = (TextureHandle*)ppgMallocF(ixNums * 4);
+
+    if (tch->handle == NULL) {
+        flLogOut("Failed to allocate texture handle memory. \n"); // Failed to allocate texture handle memory.
+        goto error_handler;
+    }
+
+    for (i = 0; i < ixNums; i++) {
+        tch->handle[i].b16[0] = 0;
+        tch->handle[i].b16[1] = 0x8000;
+    }
+
+    ofs = 0;
+
+    while (1) {
+        ppg = (PPGFileHeader*)(tch->srcAdrs + ofs);
+
+        if (MAGIC_TO_INT("pEND") != REVERT_U32(ppg->magic)) {
+            if (MAGIC_TO_INT("pTEX") == REVERT_U32(ppg->magic)) {
+                tch->textures += 1;
+            }
+
+            ofs += (REVERT_U32(ppg->fileSize) + 3) & ~3;
+        } else {
+            break;
+        }
+    }
+
+    if (tch->textures == 0) {
+        flLogOut("Texture data was not found.\n"); // Texture data was not found.
+        goto error_handler;
+    }
+
+    tch->offset = ppgMallocF(tch->textures * 4);
+
+    if (tch->offset == NULL) {
+        // Failed to allocate memory for the texture data offset table.
+        flLogOut("Failed to allocate memory for the texture data offset table.\n");
+        goto error_handler;
+    }
+
+    ofs = 0;
+
+    while (1) {
+        ppg = (PPGFileHeader*)(tch->srcAdrs + ofs);
+
+        if (MAGIC_TO_INT("pEND") != REVERT_U32(ppg->magic)) {
+            if (MAGIC_TO_INT("pTEX") == REVERT_U32(ppg->magic)) {
+                tch->offset[tch->accnum++] = ofs;
+            }
+
+            ofs += (REVERT_U32(ppg->fileSize) + 3) & ~3;
+        } else {
+            break;
+        }
+    }
+
+    tch->accnum = 0;
+    tch->be = 1;
+    return 1;
+
+error_handler:
+    if (tch->handle != NULL) {
+        ppgFree(tch->handle);
+    }
+
+    if (tch->offset != NULL) {
+        ppgFree(tch->offset);
+    }
+
+    tch->handle = NULL;
+    tch->offset = NULL;
+    while (1) {}
+}
+
+s32 ppgSetupTexChunk_1st_Accnum(Texture* tch, u16 accnum) {
+    if (tch == NULL) {
+        tch = ppg_w.cur->tex;
+    }
+
+    tch->accnum = accnum;
+    return 0;
+}
+
+s32 ppgSetupTexChunk_2nd(Texture* tch, s32 ixNum) {
+    PPGFileHeader* ppg;
+    TextureHandle* hnof;
+
+    if (tch == NULL) {
+        tch = ppg_w.cur->tex;
+    }
+
+    if (tch->textures <= tch->accnum) {
+        // Handle acquisition process has been called more times than the number of data stored in the texture chunk.
+        flLogOut("Handle acquisition process has been called more times than the number of data stored in the texture chunk.\n");
+        while (1) {}
+    }
+
+    hnof = tch->handle + (ixNum - tch->ixNum1st);
+    hnof->b16[1] = tch->accnum++;
+
+    if (tch->srcAdrs == NULL) {
+        // Texture chunk data has already been lost.
+        flLogOut("Texture chunk data has already been lost.\n");
+        while (1) {}
+    }
+
+    ppg = (PPGFileHeader*)(tch->srcAdrs + tch->offset[hnof->b16[1]]);
+
+    if ((ppg->pixel & 3) < 2) {
+        hnof->b16[1] |= 0x4000;
+    }
+
+    return tch->accnum;
+}
+
+/* DIAG: trace on-demand texture decompress (attract/select/bg all use this).
+ * Logs ixNum, compression type, sizes, depth, whether output is uniform, and
+ * sample bytes of source(compressed) + output(decompressed).
+ * Result: decompress is HEALTHY (ndiff large) — data IS loaded. Off. */
+#define PPG3_DIAG 0
+s32 ppgSetupTexChunk_3rd(Texture* tch, s32 ixNum, u32 attribute) {
+    plContext bits;
+    PPGFileHeader* ppg;
+    TextureHandle* hnof;
+    s32 koCmpr;
+    s32 cmpSize;
+    s32 mltSize;
+    void* cmpAdrs;
+    void* mltAdrs;
+
+    s32 unused_s5;
+
+    if (tch == NULL) {
+        tch = ppg_w.cur->tex;
+    }
+
+    if (tch->flags & 1) {
+        tch->arCnt = tch->arInit;
+    }
+
+    hnof = tch->handle + (ixNum - tch->ixNum1st);
+
+    if (hnof->b16[0]) {
+        return 1;
+    }
+
+    if (tch->srcAdrs == NULL) {
+        // Texture chunk data has already been lost.
+        flLogOut("Texture chunk data has already been lost.\n");
+        while (1) {}
+    }
+
+    ppg = (PPGFileHeader*)(tch->srcAdrs + (tch->offset[hnof->b16[1] & 0xFFF]));
+    ppgSetupContextFromPPG(ppg, &bits);
+    koCmpr = ppg->compress & 3;
+    cmpSize = (u16)REVERT_U16(ppg->transNums) * 3 + 0x10;
+    cmpAdrs = (u8*)ppg + cmpSize;
+    cmpSize = REVERT_U32(ppg->fileSize) - cmpSize;
+    mltSize = bits.height * bits.pitch;
+    bits.ptr = (void*) flPS2GetSystemMemoryHandle(mltSize, 2);
+    mltAdrs = flPS2GetSystemBuffAdrs((u32) bits.ptr);
+
+    if (mltAdrs == NULL) {
+        // Failed to allocate texture data expansion area.
+        flLogOut("Failed to allocate texture data expansion area. \n");
+        while (1) {}
+    }
+
+    if (mltSize != ppgDecompress(koCmpr, cmpAdrs, cmpSize, mltAdrs, mltSize)) {
+        // Failed to acquire sprite texture handle.
+        flLogOut("Failed to acquire sprite texture handle.\n");
+        //ppgPushDecBuff(mltAdrs);
+        while (1) {}
+    }
+
+    unused_s5 = 0;
+    ppgChangeDataEndian(mltAdrs, mltSize, ppg->pixel & 4, ppg->formARGB == 0x8888, bits.bitdepth, unused_s5);
+
+#if PPG3_DIAG
+    {
+        const u8 *m = (const u8 *)mltAdrs;
+        s32 ndiff = 0;                 /* bytes differing from m[0] over WHOLE buffer */
+        for (s32 q = 1; q < mltSize; q++) if (m[q] != m[0]) ndiff++;
+        extern void debug_print(const char *fmt, ...);
+        static u32 n3;
+        if (n3++ < 64)
+            debug_print("PPG3 ix=%ld koCmpr=%ld mlt=%ld depth=%d ndiff=%ld first=%02X mid=%02X end=%02X",
+                        (long)ixNum, (long)koCmpr, (long)mltSize, bits.bitdepth,
+                        (long)ndiff, m[0], m[mltSize / 2], m[mltSize - 1]);
+    }
+#endif
+
+    //bits.ptr = mltAdrs;
+    hnof->b16[0] = flCreateTextureHandle(&bits, attribute, 1);
+    //ppgPushDecBuff(mltAdrs);
+
+    if (hnof->b16[0] == 0) {
+        // Failed to acquire texture handle.
+        flLogOut("Failed to acquire texture handle.\n");
+        while (1) {}
+    }
+
+    return 1;
+}
+
+void ppgSetupContextFromPPL(PPLFileHeader* ppl, plContext* bits) {
+    bits->desc = 0;
+    bits->width = pplColorModeWidth[ppl->c_mode & 3] < 17 ? 16 : 256;
+    bits->height = 1;
+    bits->bitdepth = ppl->formARGB != 0x8888 ? 2 : 4;
+    bits->pitch = bits->width * bits->bitdepth;
+    bits->ptr = NULL;
+
+    switch ((u16)REVERT_U16(ppl->formARGB)) {
+    case 0x1555:
+        bits->pixelformat.rl = 5;
+        bits->pixelformat.rs = 0xA;
+        bits->pixelformat.rm = 0x1F;
+        bits->pixelformat.gl = 5;
+        bits->pixelformat.gs = 5;
+        bits->pixelformat.gm = 0x1F;
+        bits->pixelformat.bl = 5;
+        bits->pixelformat.bs = 0;
+        bits->pixelformat.bm = 0x1F;
+        bits->pixelformat.al = 1;
+        bits->pixelformat.as = 0xF;
+        bits->pixelformat.am = 1;
+        break;
+
+    case 0x565:
+        bits->pixelformat.rl = 5;
+        bits->pixelformat.rs = 0xB;
+        bits->pixelformat.rm = 0x1F;
+        bits->pixelformat.gl = 6;
+        bits->pixelformat.gs = 5;
+        bits->pixelformat.gm = 0x3F;
+        bits->pixelformat.bl = 5;
+        bits->pixelformat.bs = 0;
+        bits->pixelformat.bm = 0x1F;
+        bits->pixelformat.al = 0;
+        bits->pixelformat.as = 0;
+        bits->pixelformat.am = 0;
+        break;
+
+    case 0x4444:
+        bits->pixelformat.rl = 4;
+        bits->pixelformat.rs = 8;
+        bits->pixelformat.rm = 0xF;
+        bits->pixelformat.gl = 4;
+        bits->pixelformat.gs = 4;
+        bits->pixelformat.gm = 0xF;
+        bits->pixelformat.bl = 4;
+        bits->pixelformat.bs = 0;
+        bits->pixelformat.bm = 0xF;
+        bits->pixelformat.al = 4;
+        bits->pixelformat.as = 0xC;
+        bits->pixelformat.am = 0xF;
+        break;
+
+    default:
+        bits->pixelformat.rl = 8;
+        bits->pixelformat.rs = 0x10;
+        bits->pixelformat.rm = 0xFF;
+        bits->pixelformat.gl = 8;
+        bits->pixelformat.gs = 8;
+        bits->pixelformat.gm = 0xFF;
+        bits->pixelformat.bl = 8;
+        bits->pixelformat.bs = 0;
+        bits->pixelformat.bm = 0xFF;
+        bits->pixelformat.al = 8;
+        bits->pixelformat.as = 0x18;
+        bits->pixelformat.am = 0xFF;
+        break;
+    }
+}
+
+void ppgSetupContextFromPPG(PPGFileHeader* ppg, plContext* bits) {
+    bits->desc = 0;
+    bits->width = ppg->width * 16;
+    bits->height = ppg->height * 16;
+
+    switch (ppg->pixel & 3) {
+    case 0:
+        if (ppg->pixel & 0x20) {
+            bits->desc |= 0x24;
+        } else {
+            bits->desc |= 0x14;
+        }
+
+        bits->bitdepth = 0;
+        bits->pitch = bits->width / 2;
+        break;
+
+    case 1:
+        bits->desc = bits->desc | 4;
+        bits->bitdepth = 1;
+        bits->pitch = bits->width;
+        break;
+
+    case 2:
+        bits->bitdepth = 2;
+        bits->pitch = bits->width * 2;
+        break;
+
+    default:
+        bits->bitdepth = 4;
+        bits->pitch = bits->width * 4;
+        break;
+    }
+
+    switch ((u16)REVERT_U16(ppg->formARGB)) {
+    case 0x1555:
+        bits->pixelformat.rl = 5;
+        bits->pixelformat.rs = 0xA;
+        bits->pixelformat.rm = 0x1F;
+        bits->pixelformat.gl = 5;
+        bits->pixelformat.gs = 5;
+        bits->pixelformat.gm = 0x1F;
+        bits->pixelformat.bl = 5;
+        bits->pixelformat.bs = 0;
+        bits->pixelformat.bm = 0x1F;
+        bits->pixelformat.al = 1;
+        bits->pixelformat.as = 0xF;
+        bits->pixelformat.am = 1;
+        break;
+
+    case 0x565:
+        bits->pixelformat.rl = 5;
+        bits->pixelformat.rs = 0xB;
+        bits->pixelformat.rm = 0x1F;
+        bits->pixelformat.gl = 6;
+        bits->pixelformat.gs = 5;
+        bits->pixelformat.gm = 0x3F;
+        bits->pixelformat.bl = 5;
+        bits->pixelformat.bs = 0;
+        bits->pixelformat.bm = 0x1F;
+        bits->pixelformat.al = 0;
+        bits->pixelformat.as = 0;
+        bits->pixelformat.am = 0;
+        break;
+
+    case 0x4444:
+        bits->pixelformat.rl = 4;
+        bits->pixelformat.rs = 8;
+        bits->pixelformat.rm = 0xF;
+        bits->pixelformat.gl = 4;
+        bits->pixelformat.gs = 4;
+        bits->pixelformat.gm = 0xF;
+        bits->pixelformat.bl = 4;
+        bits->pixelformat.bs = 0;
+        bits->pixelformat.bm = 0xF;
+        bits->pixelformat.al = 4;
+        bits->pixelformat.as = 0xC;
+        bits->pixelformat.am = 0xF;
+        break;
+
+    case 0x8888:
+        bits->pixelformat.rl = 8;
+        bits->pixelformat.rs = 0x10;
+        bits->pixelformat.rm = 0xFF;
+        bits->pixelformat.gl = 8;
+        bits->pixelformat.gs = 8;
+        bits->pixelformat.gm = 0xFF;
+        bits->pixelformat.bl = 8;
+        bits->pixelformat.bs = 0;
+        bits->pixelformat.bm = 0xFF;
+        bits->pixelformat.al = 8;
+        bits->pixelformat.as = 0x18;
+        bits->pixelformat.am = 0xFF;
+        break;
+
+    default:
+        bits->pixelformat.rl = 0;
+        bits->pixelformat.rs = 0;
+        bits->pixelformat.rm = 0;
+        bits->pixelformat.gl = 0;
+        bits->pixelformat.gs = 0;
+        bits->pixelformat.gm = 0;
+        bits->pixelformat.bl = 0;
+        bits->pixelformat.bs = 0;
+        bits->pixelformat.bm = 0;
+        bits->pixelformat.al = 0;
+        bits->pixelformat.as = 0;
+        bits->pixelformat.am = 0;
+        break;
+    }
+}
+
+s32 ppgReleasePaletteHandle(Palette* pch, s32 ixNum) {
+    s32 i;
+    s32 ix;
+    u16 han;
+
+    if (pch == NULL) {
+        pch = ppg_w.cur->pal;
+    }
+
+    if (pch == NULL) {
+        return 0;
+    }
+
+    if (pch->be == 0) {
+        return 0;
+    }
+
+    if (ixNum < 0) {
+        for (i = 0; i < pch->total; i++) {
+            han = pch->handle[i];
+
+            if (han) {
+                flReleasePaletteHandle(han);
+            }
+
+            pch->handle[i] = 0;
+        }
+
+    } else {
+        ix = ixNum - pch->ixNum1st;
+
+        if ((ix >= 0) && (ix < pch->total)) {
+            han = pch->handle[ix];
+
+            if (han) {
+                flReleasePaletteHandle(han);
+            }
+
+            pch->handle[ix] = 0;
+        }
+    }
+
+    return ppgCheckPaletteDataBe(pch);
+}
+
+s32 ppgReleaseTextureHandle(Texture* tch, s32 ixNum) {
+    s32 i;
+    s32 ix;
+    u16 han;
+
+    if (tch == NULL) {
+        tch = ppg_w.cur->tex;
+    }
+
+    if (tch == NULL) {
+        return 0;
+    }
+
+    if (tch->be == 0) {
+        return 0;
+    }
+
+    if (ixNum < 0) {
+        for (i = 0; i < tch->total; i++) {
+            han = tch->handle[i].b16[0];
+
+            if (han) {
+                flReleaseTextureHandle(han);
+            }
+
+            tch->handle[i].b16[0] = 0;
+
+            if (tch->flags & 0x80) {
+                tch->handle[i].b16[1] = 0;
+            }
+        }
+    } else {
+        ix = ixNum - tch->ixNum1st;
+
+        if ((ix >= 0) && (ix < tch->total)) {
+            han = tch->handle[ix].b16[0];
+
+            if (han) {
+                flReleaseTextureHandle(han);
+            }
+
+            tch->handle[ix].b16[0] = 0;
+
+            if (tch->flags & 0x80) {
+                tch->handle[ix].b16[1] = 0;
+            }
+        }
+    }
+
+    return ppgCheckTextureDataBe(tch);
+}
+
+s32 ppgCheckTextureDataBe(Texture* tch) {
+    s32 i;
+
+    if (tch->be == 0) {
+        return 0;
+    }
+
+    for (i = 0; i < tch->total; i++) {
+        if (tch->handle[i].b16[0]) {
+            break;
+        }
+    }
+
+    if (i == tch->total) {
+        if (tch->handle != NULL) {
+            ppgFree(tch->handle);
+        }
+
+        if (tch->offset != NULL) {
+            ppgFree(tch->offset);
+        }
+
+        tch->handle = NULL;
+        tch->offset = NULL;
+        tch->be = 0;
+    }
+
+    return tch->be;
+}
+
+s32 ppgCheckPaletteDataBe(Palette* pch) {
+    s32 i;
+
+    if (pch->be == 0) {
+        return 0;
+    }
+
+    for (i = 0; i < pch->total; i++) {
+        if (pch->handle[i]) {
+            break;
+        }
+    }
+
+    if (i == pch->total) {
+        if (pch->handle != NULL) {
+            ppgFree(pch->handle);
+        }
+
+        pch->handle = NULL;
+        pch->be = 0;
+    }
+
+    return pch->be;
+}
+
+s32 ppgGetUsingTextureHandle(Texture* tch, s32 ixNums) {
+    if (tch == NULL) {
+        tch = ppg_w.cur->tex;
+
+        if (tch == NULL) {
+            return 0;
+        }
+    }
+
+    if (tch->be == 0) {
+        return 0;
+    }
+
+    if (tch->handle == NULL) {
+        return 0;
+    }
+
+    ixNums -= tch->ixNum1st;
+
+    if (ixNums < 0 || ixNums >= tch->textures) {
+        return 0;
+    } else {
+        return tch->handle[ixNums].b16[0];
+    }
+}
+
+s32 ppgGetUsingPaletteHandle(Palette* pch, s32 ixNums) {
+    if (pch == NULL) {
+        pch = ppg_w.cur->pal;
+
+        if (pch == NULL) {
+            return 0;
+        }
+    }
+
+    if (pch->be == 0) {
+        return 0;
+    }
+
+    if (pch->handle == NULL) {
+        return 0;
+    }
+
+    ixNums -= pch->ixNum1st;
+
+    if (ixNums < 0 || ixNums >= pch->total) {
+        return 0;
+    } else {
+        return pch->handle[ixNums];
+    }
+}
+
+s32 ppgCheckTextureNumber(Texture* tex, s32 num) {
+    u16 ix;
+
+    if (tex == NULL) {
+        tex = ppg_w.cur->tex;
+
+        if (tex == NULL) {
+            return 0;
+        }
+    }
+
+    if (tex->be == 0) {
+        return 0;
+    }
+
+    ix = num - tex->ixNum1st;
+
+    if (ix >= tex->total) {
+        return 0;
+    }
+
+    if (tex->handle[ix].b16[0]) {
+        return 1;
+    }
+
+    return 0;
+}

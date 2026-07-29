@@ -1,0 +1,49 @@
+#ifndef PPGFILE_H
+#define PPGFILE_H
+
+#include "common/sprites.h"
+#include "structs.h"
+#include "types.h"
+#include "malloc.h"
+
+typedef struct {
+    // total size: 0x34
+    PPGDataList* cur; // offset 0x0, size 0x4
+    u16 hanPal;       // offset 0x4, size 0x2
+    u16 hanTex;       // offset 0x6, size 0x2
+    _MEMMAN_OBJ mm;   // offset 0x8, size 0x2C
+} PPG_W;
+
+extern void* currentTexture;
+extern s32 currentPalette;
+
+extern s16* dctex_linear; // size: 0x4, address: 0x57A950
+extern PPG_W ppg_w;
+
+void ppg_Initialize(void* lcmAdrs, s32 lcmSize);
+void ppgSourceDataReleased(PPGDataList* dlist);
+void ppgSetupCurrentDataList(PPGDataList* dlist);
+void ppgSetupCurrentPaletteNumber(Palette* pal, s32 num);
+s32 ppgWriteQuadWithST_B(Vertex* pos, u32 col, PPGDataList* tb, s32 tix, s32 cix);
+s32 ppgWriteQuadWithST_B2(Vertex* pos, u32 col, PPGDataList* tb, s32 tix, s32 cix);
+void quadOnly2DrawLast(u32 texCode);
+s32 ppgSetupPalChunk(Palette* pch, u8* adrs, s32 size, s32 ixNum1st, s32 num, s32 /* unused */);
+void ppgRenewDotDataSeqs(u32 gix, u32* srcRam, u32 code, u32 size);
+void ppgMakeConvTableTexDC();
+s32 ppgSetupTexChunk_1st(Texture* tch, u8* adrs, ssize_t size, s32 ixNum1st, s32 ixNums, s32 ar, s32 arcnt);
+s32 ppgSetupTexChunk_1st_Accnum(Texture* tch, u16 accnum);
+s32 ppgSetupTexChunk_2nd(Texture* tch, s32 ixNum);
+s32 ppgSetupTexChunk_3rd(Texture* tch, s32 ixNum, u32 attribute);
+s32 ppgWriteQuadUseTrans(Vertex* pos, u32 col, PPGDataList* tb, s32 tix, s32 cix, s32 flip, s32 pal);
+s32 ppgGetUsingTextureHandle(Texture* tch, s32 ixNums);
+s32 ppgGetUsingPaletteHandle(Palette* pch, s32 ixNums);
+s32 ppgCheckTextureNumber(Texture* tex, s32 num);
+s32 ppgReleasePaletteHandle(Palette* pch, s32 ixNum);
+s32 ppgReleaseTextureHandle(Texture* tch, s32 ixNum);
+s32 ppgSetupTexChunkSeqs(Texture* tch, PPGFileHeader* ppg, u8* adrs, s32 ixNum1st, s32 ixNums, u32 attribute);
+s32 ppgRenewTexChunkSeqs(Texture* tch);
+s32 ppgSetupCmpChunk(u8* srcAdrs, s32 num, u8* dstAdrs);
+s32 ppgSetupPalChunkDir(Palette* pch, PPLFileHeader* ppl, u8* adrs, s32 ixNum1st, s32 /* unused */);
+s32 ppgCheckTextureDataBe(Texture* tch);
+
+#endif // PPGFILE_H
