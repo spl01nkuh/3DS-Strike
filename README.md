@@ -5,6 +5,8 @@ A 3DS  port of Street Fighter III: 3rd Strike.
 Based on the PS2 decompilation  https://github.com/crowded-street/3s-decomp
 And the PC port https://github.com/crowded-street/3sx
 
+IMPORTANT: This project is / was an experiment for me to see how far an AI model could go; but keeping it to myself isn't very nice. As such, no detailed technical support will be provided and the project is essentially abandoned for now. It might be periodically updated with fixes, but most likely not later than August 10th (when my subscription to Claude ends). 
+
 # WHAT YOU NEED
 
 YOU are responsible for providing a LEGITIMATE (NON-PIRATED, MOST LIKELY A PHYSICAL COPY) PLAYSTATION 2 copy of Third Strike, specifically the SF33RD.AFS file. You are also responsible for dumping dspfirm.cdc FROM YOUR 3DS if you want sound.
