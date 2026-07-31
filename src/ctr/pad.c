@@ -75,11 +75,20 @@ void tarPADRead(void) {
     if (held & KEY_SELECT) sw |= 0x4000;
 
     /* New 3DS extras: ZL/ZR drive the game's two otherwise-unreachable config
-     * slots (SWK_LEFT_SHOULDER / SWK_LEFT_TRIGGER -> Shot[3] / Shot[7]) so they
-     * show up as fully remappable buttons in BUTTON CONFIG. They default to
-     * 3P / 3K (see Setup_IO_ConvDataDefault in SYS_sub.c). */
-    if (held & KEY_ZL) sw |= 0x0080; /* SWK_LEFT_SHOULDER -> Shot[3] (default 3P) */
-    if (held & KEY_ZR) sw |= 0x0800; /* SWK_LEFT_TRIGGER  -> Shot[7] (default 3K) */
+     * slots so they show up as fully remappable buttons in BUTTON CONFIG. Both
+     * default to unbound (see Game_Default_Data / ioConvInitData in SYS_sub.c).
+     *
+     * The bit written here is NOT the slot the game ends up reading, and the
+     * mapping is the reverse of what it looks like. keyConvert() (IOConv.c)
+     * passes pad->sw through ioconv_table, which swaps the low and high button
+     * halves; the six assignments above already emit the opposite-half bit to
+     * compensate, this pair does not. Measured on the emulated pad:
+     *   ZL: HID 0x4000 -> sw 0x0080 -> converted 0x0800 -> Shot[7]
+     *   ZR: HID 0x8000 -> sw 0x0800 -> converted 0x0080 -> Shot[3]
+     * sc_sub.c's label table encodes that (slot 3 = ZR, slot 7 = ZL). Change
+     * one without the other and the two config rows edit each other's binding. */
+    if (held & KEY_ZL) sw |= 0x0080; /* -> converted 0x0800 -> Shot[7] */
+    if (held & KEY_ZR) sw |= 0x0800; /* -> converted 0x0080 -> Shot[3] */
 
     tp->sw = sw;
 

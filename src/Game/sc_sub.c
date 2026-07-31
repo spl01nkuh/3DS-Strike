@@ -2278,7 +2278,14 @@ static const char *sf3_btn_label(s32 ix) {
      * swap these two independently of the binding, or setting an option on
      * the row labeled "ZL" silently binds physical ZR instead (and vice
      * versa), which is exactly the wrong-button-fires bug this caused. */
-    static const char *const tbl[8] = { "A", "B", "R", "ZL", "X", "Y", "L", "ZR" };
+    /* Slots 3 and 7 are ZR and ZL, NOT the other way round. Measured on the
+     * emulated pad: ZL (HID 0x4000) -> pad word 0x0080 -> converted 0x0800 ->
+     * Shot[7]; ZR (HID 0x8000) -> pad word 0x0800 -> converted 0x0080 ->
+     * Shot[3]. ioconv_table (IOConv.c) swaps the low and high button halves,
+     * and unlike the six face/shoulder keys, ctr/pad.c does not compensate for
+     * this pair. While these two were labelled the wrong way round, the ZL and
+     * ZR config rows each edited the other's binding. */
+    static const char *const tbl[8] = { "A", "B", "R", "ZR", "X", "Y", "L", "ZL" };
     return (ix >= 0 && ix < 8) ? tbl[ix] : NULL;
 }
 
