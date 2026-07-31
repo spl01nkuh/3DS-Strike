@@ -902,14 +902,17 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
             for (int tx = 0; tx < tiles_x_cell; tx++) {
                 texel_t* tile_dst = &strip_data[(row_base + tx) * 64];
                 const u8* s = src_row + tx * 8;
-                tile_dst[m[0]] = pal_colors[s[0]];
-                tile_dst[m[1]] = pal_colors[s[1]];
-                tile_dst[m[2]] = pal_colors[s[2]];
-                tile_dst[m[3]] = pal_colors[s[3]];
-                tile_dst[m[4]] = pal_colors[s[4]];
-                tile_dst[m[5]] = pal_colors[s[5]];
-                tile_dst[m[6]] = pal_colors[s[6]];
-                tile_dst[m[7]] = pal_colors[s[7]];
+                /* Two RGBA4 texels per u32 store, matching the pool build path.
+                 * Morton pairs an even x with the next index (m[1]==m[0]+1 —
+                 * the l8 writes below already depend on that), and an even
+                 * morton index puts the pair on a 4-byte boundary within the
+                 * 128B-aligned tile, so the wide store is aligned. Halving the
+                 * store count is a real win on the 268MHz ARM11 and the output
+                 * is bit-identical to the eight scalar stores it replaces. */
+                *(u32*)&tile_dst[m[0]] = (u32)pal_colors[s[0]] | ((u32)pal_colors[s[1]] << 16);
+                *(u32*)&tile_dst[m[2]] = (u32)pal_colors[s[2]] | ((u32)pal_colors[s[3]] << 16);
+                *(u32*)&tile_dst[m[4]] = (u32)pal_colors[s[4]] | ((u32)pal_colors[s[5]] << 16);
+                *(u32*)&tile_dst[m[6]] = (u32)pal_colors[s[6]] | ((u32)pal_colors[s[7]] << 16);
                 if (l8) {
                     u8* idx = &l8[(l8_row_base + tx) * 64];
                     *(u16*)&idx[m[0]] = (u16)(s[0] | (s[1] << 8));
