@@ -81,10 +81,12 @@ void tarPADRead(void) {
      * The bit written here is NOT the slot the game reads. keyConvert() passes
      * pad->sw through ioconv_table (IOConv.c), which swaps the low and high
      * button halves (0x10<->0x100 ... 0x80<->0x800), and only then does
-     * Convert_User_Setting() index Shot[] off the result. So 0x80 below becomes
-     * SWK_LEFT_TRIGGER -> Shot[7], and 0x800 becomes SWK_LEFT_SHOULDER ->
-     * Shot[3]. sc_sub.c's label table encodes the post-swap owners; change one
-     * without the other and the config rows edit each other's bindings. */
+     * Convert_User_Setting() index Shot[] off the result. The six assignments
+     * above already emit the opposite-half bit so they land on their intended
+     * slot; this pair does not, so 0x80 below arrives as SWK_LEFT_TRIGGER ->
+     * Shot[7] and 0x800 arrives as SWK_LEFT_SHOULDER -> Shot[3]. sc_sub.c's
+     * label table encodes that (slot 3 = ZR, slot 7 = ZL); change one without
+     * the other and the two config rows edit each other's bindings. */
     if (held & KEY_ZL) sw |= 0x0080; /* -> SWK_LEFT_TRIGGER  -> Shot[7] */
     if (held & KEY_ZR) sw |= 0x0800; /* -> SWK_LEFT_SHOULDER -> Shot[3] */
 

@@ -2266,23 +2266,25 @@ const u8 scrnAddTex1UV[9][4] = { { 96, 0, 32, 32 },  { 63, 0, 32, 32 },  { 0, 96
 /* Button-sprite index -> the 3DS key that drives that config slot. The index
  * matches the game's Shot[] slot order (and the scrnAddTex1UV sprite sheet).
  *
- * Deriving which physical key owns a slot means following the WHOLE chain, not
- * just ctr/pad.c: keyConvert() runs pad->sw through ioconv_table (IOConv.c),
- * which deliberately swaps the low and high button halves (0x10<->0x100 ...
- * 0x80<->0x800) before Convert_User_Setting() indexes Shot[] off the result.
- * pad.c emitting 0x80 for ZL therefore lands on SWK_LEFT_TRIGGER -> Shot[7],
- * not Shot[3]. Accounting for that swap, the real owners are:
- *   0 WEST(X)   1 NORTH(Y)  2 R_SHOULDER(L) 3 L_SHOULDER(ZR)
- *   4 SOUTH(A)  5 EAST(B)   6 R_TRIGGER(R)  7 L_TRIGGER(ZL)
+ * Which physical key owns a slot is not read off ctr/pad.c alone: keyConvert()
+ * runs pad->sw through ioconv_table (IOConv.c), which swaps the low and high
+ * button halves (0x10<->0x100 ... 0x80<->0x800) before Convert_User_Setting()
+ * indexes Shot[]. For the six face/shoulder buttons pad.c already emits the
+ * opposite-half bit to compensate, so those land where this table says. ZL and
+ * ZR were the pair that did NOT compensate: pad.c emits 0x80 for ZL, which the
+ * swap turns into SWK_LEFT_TRIGGER -> Shot[7], and 0x800 for ZR, which becomes
+ * SWK_LEFT_SHOULDER -> Shot[3]. Hence ZR on slot 3 and ZL on slot 7 below.
+ *   0 WEST(A)   1 NORTH(B)  2 R_SHOULDER(R) 3 L_SHOULDER(ZR)
+ *   4 SOUTH(X)  5 EAST(Y)   6 R_TRIGGER(L)  7 L_TRIGGER(ZL)
  * NULL keeps the original art (the big controller diagram at ix 8). */
 extern void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label);
 static const char *sf3_btn_label(s32 ix) {
-    /* Glyph per slot, matching the physical 3DS button that actually drives it
-     * once ioconv_table's half-swap is applied. The label at each slot MUST
-     * match what actually gets bound there -- when these disagreed, the rows
-     * labelled ZL and ZR each edited the other's binding, so binding ZR left
-     * physical ZR dead and gave the function to ZL. */
-    static const char *const tbl[8] = { "X", "Y", "L", "ZR", "A", "B", "R", "ZL" };
+    /* Glyph per slot, matching the physical 3DS button that actually drives it.
+     * The label at each slot MUST match what gets bound there -- while slots 3
+     * and 7 claimed ZL and ZR the wrong way round, the two config rows each
+     * edited the other's binding, so setting ZR left physical ZR dead and gave
+     * the function to ZL. */
+    static const char *const tbl[8] = { "A", "B", "R", "ZR", "X", "Y", "L", "ZL" };
     return (ix >= 0 && ix < 8) ? tbl[ix] : NULL;
 }
 

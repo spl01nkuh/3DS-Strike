@@ -1869,13 +1869,13 @@ void Button_Config_Sub(s16 PL_id) {
 }
 
 /* BUTTON CONFIG visual row order. Slots are owned by physical keys in the order
- * (X,Y,L,ZR,A,B,R,ZL) -- see sf3_btn_label() in sc_sub.c for why ioconv_table's
- * half-swap makes that differ from ctr/pad.c's apparent assignment. This table
- * maps each on-screen row (top to bottom) to its underlying slot so the rows
- * still read Y, X, L, R, B, A, ZL, ZR. Used here (editing) and in EFF10.c
- * (glyph + function name), so the two stay in agreement. Rows 8/9/10 =
- * vibration/default/exit bypass this. */
-const u8 Button_Cfg_Order[8] = { 1, 0, 2, 6, 5, 4, 7, 3 };
+ * (A,B,R,ZR,X,Y,L,ZL) -- note slots 3 and 7, see sf3_btn_label() in sc_sub.c.
+ * This table maps each on-screen row (top to bottom) to its underlying slot so
+ * the rows read Y, X, L, R, B, A, ZL, ZR. The last two entries are 7 then 3
+ * because physical ZL drives slot 7 and ZR drives slot 3. Used here (editing)
+ * and in EFF10.c (glyph + function name), so the two stay in agreement.
+ * Rows 8/9/10 = vibration/default/exit bypass this. */
+const u8 Button_Cfg_Order[8] = { 5, 4, 6, 2, 1, 0, 7, 3 };
 
 void Button_Move_Sub_LR(u16 sw, s16 cursor_id) {
     s16 max;
