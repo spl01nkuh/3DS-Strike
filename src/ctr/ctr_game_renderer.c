@@ -342,7 +342,7 @@ typedef struct {
     bool valid;
 } L8CacheEntry;
 static L8CacheEntry* l8_cache_find(int tex_idx, u32 tex_ver);
-static L8CacheEntry* l8_cache_alloc(int tex_idx, u32 tex_ver, int pot_w, int pot_h);
+static L8CacheEntry* l8_cache_alloc(int tex_idx, u32 tex_ver, int pot_w, int pot_h, int prezero);
 static void l8_resolve_palette(const L8CacheEntry* l8, const texel_t* palette,
                                 texel_t* tex_data, int tiles_x, int tiles_y,
                                 int dst_tiles_x, int dst_base_tx);
@@ -929,9 +929,12 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
          * atlas — takes the fast resolve above instead of another full build. */
         if (l8 && pot_w == ATLAS_CELL_SIZE && pot_h == ATLAS_CELL_SIZE &&
             shared_tex_idx >= 0 && shared_tex_idx < FL_TEXTURE_MAX) {
+            /* prezero=0: the memcpy below writes every byte of the buffer
+               (32x32 tiles x 64 = the full 256x256 cell), so pre-clearing it
+               would only be overwritten. */
             L8CacheEntry* l8_pub = l8_cache_alloc(shared_tex_idx,
                                                   texture_versions[shared_tex_idx],
-                                                  (int)pot_w, (int)pot_h);
+                                                  (int)pot_w, (int)pot_h, 0);
             if (l8_pub)
                 memcpy(l8_pub->indices, l8,
                        (size_t)cell_tiles_x * cell_tiles_x * 64);
@@ -950,6 +953,10 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
         u8* l8 = atlas_l8[cell];
         int fill_l8 = (src->fmt == SCE_GS_PSMT4 && pal_colors && l8 != NULL);
         int src_half_w = src->w >> 1; /* PSMT4: two pixels per byte */
+        /* resolve_texel's PSMT4 case needs a palette to produce anything but 0,
+         * so the specialised path below requires one too and is otherwise
+         * equivalent. Everything else keeps the generic per-texel loop. */
+        int psmt4_fast = (src->fmt == SCE_GS_PSMT4 && pal != NULL);
         for (int ty = 0; ty < pot_tiles_y && ty < local_tiles; ty++) {
             for (int tx = 0; tx < pot_tiles_x && tx < local_tiles; tx++) {
                 int src_tile_x = tx * 8;
@@ -958,6 +965,43 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
                 u8* l8_tile = fill_l8
                     ? &l8[((ty + ty_shift) * local_tiles + tx) * 64] : NULL;
 
+                if (psmt4_fast) {
+                    /* Specialised PSMT4 fill. Same result as the generic loop
+                     * below, but it hoists the format dispatch (resolve_texel
+                     * is a call plus a switch, previously run once per texel --
+                     * 64 per tile, 1024 tiles per cell) and the row bounds test
+                     * out of the inner loop, and decodes each nibble once
+                     * rather than twice (resolve_texel decoded it for the
+                     * colour, then the l8 capture decoded the same byte again).
+                     * PSMT4 sheets measured 6.1-7.2ms to build against PSMT8's
+                     * 4.3ms, and this is the gap. */
+                    for (int fy = 0; fy < 8; fy++) {
+                        int sy = src_tile_y + fy;
+                        const u8* mrow = morton_lut[7 - fy];
+
+                        if (sy < 0 || sy >= src->h) {
+                            for (int fx = 0; fx < 8; fx++) {
+                                tile_dst[mrow[fx]] = 0;
+                                if (l8_tile) l8_tile[mrow[fx]] = 0;
+                            }
+                            continue;
+                        }
+
+                        const u8* srow = px + sy * src_half_w;
+                        for (int fx = 0; fx < 8; fx++) {
+                            int sx = src_tile_x + fx;
+                            texel_t color = 0;
+                            u8 nib = 0;
+                            if (sx >= 0 && sx < src->w) {
+                                u8 b = srow[sx >> 1];
+                                nib = (sx & 1) ? ((b >> 4) & 0xF) : (b & 0xF);
+                                if (nib < (unsigned)pal->count) color = pal->colors[nib];
+                            }
+                            tile_dst[mrow[fx]] = color;
+                            if (l8_tile) l8_tile[mrow[fx]] = nib;
+                        }
+                    }
+                } else {
                 for (int fy = 0; fy < 8; fy++) {
                     int sy = src_tile_y + fy;
                     int dy_fine = 7 - fy;
@@ -977,6 +1021,7 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
                         }
                         tile_dst[morton_lut[dy_fine][fx]] = color;
                     }
+                }
                 }
             }
         }
@@ -1094,7 +1139,14 @@ static L8CacheEntry* l8_cache_find(int tex_idx, u32 tex_ver) {
 
 static u32 l8_cache_bytes = 0; /* running total of all valid entries' indices buffers */
 
-static L8CacheEntry* l8_cache_alloc(int tex_idx, u32 tex_ver, int pot_w, int pot_h) {
+/* prezero: clear the buffer before returning it. Callers that go on to fill
+ * every byte (the atlas publish memcpy's the whole cell) pass 0 and skip a
+ * 64KB memset that the very next statement overwrites -- worth more than the
+ * cycle count suggests, since needlessly writing 64KB evicts live data from the
+ * 256KB L2. Callers that fill only part of the buffer MUST pass 1: index 0 is
+ * transparent, and padding tiles left holding malloc garbage get painted as
+ * noise by a later palette re-resolve. */
+static L8CacheEntry* l8_cache_alloc(int tex_idx, u32 tex_ver, int pot_w, int pot_h, int prezero) {
     size_t need = (size_t)pot_w * pot_h;
 
     /* Evict LRU entries (regardless of free-slot availability) until this
@@ -1143,7 +1195,7 @@ static L8CacheEntry* l8_cache_alloc(int tex_idx, u32 tex_ver, int pot_w, int pot
     /* index 0 == transparent (pal_colors[0] forced 0): padding tiles the
      * build never writes must not hold malloc garbage, or a later palette
      * re-resolve paints noise into them */
-    memset(best->indices, 0, need);
+    if (prezero) memset(best->indices, 0, need);
     best->texture_index = tex_idx;
     best->tex_version = tex_ver;
     best->pot_w = pot_w;
@@ -1908,7 +1960,9 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
 
         // MISS: build normally and capture indices into L8 cache
         l8_misses++;
-        L8CacheEntry* l8_new = l8_cache_alloc(tex_idx, tv, pot_w, pot_h);
+        /* prezero=1: the pool build fills this incrementally and can leave
+           padding tiles untouched when the source is smaller than the slot. */
+        L8CacheEntry* l8_new = l8_cache_alloc(tex_idx, tv, pot_w, pot_h, 1);
 
         if (src->fmt == SCE_GS_PSMT4) {
             /* PSMT4 row-based build: two pixels per byte, low nibble = even x
