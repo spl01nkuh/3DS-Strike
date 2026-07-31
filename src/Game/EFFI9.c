@@ -14,7 +14,7 @@ void effect_I9_move(WORK_Other* ewk) {
 #endif
 
     WORK* sub_w = (WORK*)ewk->wu.target_adrs;
-    ImageBuff* image_buff = (ImageBuff*)sub_w + 9;
+    ImageBuff* image_buff = (ImageBuff*)(sub_w->routine_no);
     WORK_Other* mwk = (WORK_Other*)ewk->my_master;
     s16 i;
 
