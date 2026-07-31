@@ -59,17 +59,24 @@ void Setup_Candidate_Buff(s16 PL_id);
 s16 Check_EM_Buff(s16 ix, s16 ok_urien);
 s32 Check_EM_Sub(s16 ix, s16 ok_urien, s16 Rnd);
 
-/* Shot value (Convert_Data index) -> engine attack bitmask. IMPORTANT: the
- * engine groups KICKS on the low bits and PUNCHES on the high bits:
- *   LK=0x10  MK=0x20  HK=0x40   |   LP=0x100  MP=0x200  HP=0x400
- * (verified in-match; the combos confirm it: 0x70 = 3 kicks, 0x700 = 3 punches).
- * The name table (Letter_Data / button_string_data) is ordered
- *   0=LP 1=MP 2=HP 3=LK 4=MK 5=HK
- * so each index must emit the bit matching its NAME: punch group (0x100/0x200/
- * 0x400) at idx 0-2, kick group (0x10/0x20/0x40) at idx 3-5. The original table
- * had the two groups reversed, so every button did the opposite punch/kick
- * in-match even though BUTTON CONFIG displayed the right name. */
-const u16 Convert_Data[12] = { 256, 512, 1024, 16, 32, 64, 272, 544, 1088, 112, 1792, 0 };
+/* Shot value (Convert_Data index) -> engine attack bitmask. The engine groups
+ * PUNCHES on the low bits and KICKS on the high bits:
+ *   LP=0x10  MP=0x20  HP=0x40   |   LK=0x100  MK=0x200  HK=0x400
+ * Measured, not assumed: binding ZL to "L.PUNCH" (index 0) emitted the old
+ * table's 0x100 and produced a LIGHT KICK in match, and ZR to "M.PUNCH"
+ * (index 1) emitted 0x200 and produced a MEDIUM KICK; meanwhile the default
+ * Y binding (Shot[1] = 3, old table 0x10) correctly produced a light punch.
+ * A previous comment here asserted the opposite grouping -- it was wrong.
+ *
+ * The name table (EFF10.c) is ordered
+ *   0=L.PUNCH 1=M.PUNCH 2=H.PUNCH 3=L.KICK 4=M.KICK 5=H.KICK
+ *   6=L.P+L.K 7=M.P+M.K 8=H.P+H.K 9=KICK*3 10=PUNCH*3 11=NONE
+ * so each index must emit the bits matching its NAME. The old table had the
+ * two groups reversed (and 9/10 swapped with them), so choosing a binding by
+ * name gave the opposite punch/kick. Defaults hid it because their stored
+ * indices had been tuned against the reversed table; only remapping exposed it.
+ * Indices 6-8 are one bit from each group, so the swap left them unchanged. */
+const u16 Convert_Data[12] = { 16, 32, 64, 256, 512, 1024, 272, 544, 1088, 1792, 112, 0 };
 
 void Switch_Screen_Init(s32 /* unused */) {
     WipeInit();
@@ -571,7 +578,10 @@ void Setup_IO_ConvDataDefault(s32 id) {
      * BUTTON CONFIG reads Y=LP X=MP L=HP R=HK B=LK A=MK, ZL/ZR=none:
      *   A(0)=MK=4  B(1)=LK=3  R(2)=HK=5  ZL(3)=none=11
      *   X(4)=MP=1  Y(5)=LP=0  L(6)=HP=2  ZR(7)=none=11 */
-    const u8 ioConvInitData[12] = { 4, 3, 5, 11, 1, 0, 2, 11, 0, 0, 0, 0 };
+    /* Re-indexed alongside the Convert_Data group fix above: same physical
+       result as before (X=MP Y=LP L=HP A=MK B=LK R=HK, ZL/ZR unbound), but the
+       stored index now matches the NAME shown in BUTTON CONFIG. */
+    const u8 ioConvInitData[12] = { 1, 0, 2, 11, 4, 3, 5, 11, 0, 0, 0, 0 };
     s32 ix;
 
     for (ix = 0; ix < 12; ix++) {
@@ -688,11 +698,14 @@ void Copy_Check_w() {
 }
 
 const struct _SAVE_W Game_Default_Data = {
-    /* Pad_Infor[2]: per-slot Shot defaults (slot order A,B,R,ZL,X,Y,L,ZR). Clean
-     * mapping (no glyph swap): each physical button does exactly its function —
-     * Y=LP X=MP L=HP R=HK B=LK A=MK, ZL/ZR=none. Boot default copied into every
-     * mode; keep in sync with ioConvInitData (DEFAULT SETTING). */
-    { { { 4, 3, 5, 11, 1, 0, 2, 11 }, 0, { 0, 0, 0 } }, { { 4, 3, 5, 11, 1, 0, 2, 11 }, 0, { 0, 0, 0 } } },
+    /* Pad_Infor[2]: per-slot Shot defaults. Slot order is A,B,R,ZR,X,Y,L,ZL --
+     * slots 3 and 7 are ZR and ZL respectively, measured; see sf3_btn_label()
+     * in sc_sub.c. Values are Convert_Data/name-table indices, re-indexed
+     * alongside the Convert_Data group fix so the stored index matches the NAME
+     * shown in BUTTON CONFIG. Each physical button does its own function:
+     * Y=LP X=MP L=HP R=HK B=LK A=MK, ZL/ZR unbound. Boot default copied into
+     * every mode; keep in sync with ioConvInitData (DEFAULT SETTING). */
+    { { { 1, 0, 2, 11, 4, 3, 5, 11 }, 0, { 0, 0, 0 } }, { { 1, 0, 2, 11, 4, 3, 5, 11 }, 0, { 0, 0, 0 } } },
     2,
     99,
     { 1, 1 },
