@@ -1873,10 +1873,12 @@ void Button_Config_Sub(s16 PL_id) {
  * underlying slot. Clean labels (no glyph swap), so the rows read top-to-bottom
  * Y, X, L, R, B, A, ZL, ZR. Used here (editing) and in EFF10.c (glyph + function
  * name). Rows 8/9/10 = vibration/default/exit bypass this. */
-/* Last two entries are 7 then 3 because physical ZL drives Shot[7] and ZR
- * drives Shot[3] (measured; see sf3_btn_label() in sc_sub.c), so the rows still
- * read top to bottom as Y, X, L, R, B, A, ZL, ZR. */
-const u8 Button_Cfg_Order[8] = { 5, 4, 6, 2, 1, 0, 7, 3 };
+/* Maps each on-screen row (top to bottom) to its Shot[] slot. Slots are owned
+ * by (X,Y,L,ZR,A,B,R,ZL) -- measured, see sf3_btn_label() in sc_sub.c -- so
+ * these indices make the rows read Y, X, L, R, B, A, ZL, ZR. Used here for
+ * editing and in EFF10.c/EFF23.c for the glyph and function name, so all three
+ * agree. Rows 8/9/10 = vibration/default/exit bypass this. */
+const u8 Button_Cfg_Order[8] = { 1, 0, 2, 6, 5, 4, 7, 3 };
 
 void Button_Move_Sub_LR(u16 sw, s16 cursor_id) {
     s16 max;

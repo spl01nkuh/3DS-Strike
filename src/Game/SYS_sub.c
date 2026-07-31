@@ -698,13 +698,12 @@ void Copy_Check_w() {
 }
 
 const struct _SAVE_W Game_Default_Data = {
-    /* Pad_Infor[2]: per-slot Shot defaults. Slot order is A,B,R,ZR,X,Y,L,ZL --
-     * slots 3 and 7 are ZR and ZL respectively, measured; see sf3_btn_label()
-     * in sc_sub.c. Values are Convert_Data/name-table indices, re-indexed
-     * alongside the Convert_Data group fix so the stored index matches the NAME
-     * shown in BUTTON CONFIG. Each physical button does its own function:
-     * Y=LP X=MP L=HP R=HK B=LK A=MK, ZL/ZR unbound. Boot default copied into
-     * every mode; keep in sync with ioConvInitData (DEFAULT SETTING). */
+    /* Pad_Infor[2]: per-slot Shot defaults. Slot order is X,Y,L,ZR,A,B,R,ZL --
+     * measured, see sf3_btn_label() in sc_sub.c. Values are Convert_Data /
+     * name-table indices, so the stored index matches the NAME shown in BUTTON
+     * CONFIG. Gives Y=LP X=MP L=HP R=HK B=LK A=MK with ZL/ZR unbound. Boot
+     * default copied into every mode; keep in sync with ioConvInitData
+     * (DEFAULT SETTING). */
     { { { 1, 0, 2, 11, 4, 3, 5, 11 }, 0, { 0, 0, 0 } }, { { 1, 0, 2, 11, 4, 3, 5, 11 }, 0, { 0, 0, 0 } } },
     2,
     99,
