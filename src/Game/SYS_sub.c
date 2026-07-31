@@ -688,11 +688,8 @@ void Copy_Check_w() {
 }
 
 const struct _SAVE_W Game_Default_Data = {
-    /* Pad_Infor[2]: per-slot Shot defaults. Slots are owned by physical keys in
-     * the order A,B,R,ZR,X,Y,L,ZL -- slots 3 and 7 are ZR and ZL respectively,
-     * not the other way round, because ioconv_table (IOConv.c) swaps the low and
-     * high button halves and ctr/pad.c does not compensate for that pair; see
-     * sf3_btn_label() in sc_sub.c. Each physical button gets its own function:
+    /* Pad_Infor[2]: per-slot Shot defaults (slot order A,B,R,ZL,X,Y,L,ZR). Clean
+     * mapping (no glyph swap): each physical button does exactly its function —
      * Y=LP X=MP L=HP R=HK B=LK A=MK, ZL/ZR=none. Boot default copied into every
      * mode; keep in sync with ioConvInitData (DEFAULT SETTING). */
     { { { 4, 3, 5, 11, 1, 0, 2, 11 }, 0, { 0, 0, 0 } }, { { 4, 3, 5, 11, 1, 0, 2, 11 }, 0, { 0, 0, 0 } } },
