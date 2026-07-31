@@ -2264,21 +2264,25 @@ const u8 scrnAddTex1UV[9][4] = { { 96, 0, 32, 32 },  { 63, 0, 32, 32 },  { 0, 96
                                  { 32, 96, 32, 32 }, { 32, 64, 32, 32 }, { 128, 0, 96, 128 } };
 
 /* Button-sprite index -> the 3DS key that drives that config slot. The index
- * matches the game's Shot[] slot order (and the scrnAddTex1UV sprite sheet):
- *   0 WEST(A)   1 NORTH(B)  2 R_SHOULDER(R) 3 L_SHOULDER(ZL)
- *   4 SOUTH(X)  5 EAST(Y)   6 R_TRIGGER(L)  7 L_TRIGGER(ZR)
- * pad.c binds each 3DS key onto these SWK bits, so prompts read correctly too:
- * imgSelectGameButton draws ix4/ix5, the SWK_SOUTH/SWK_EAST prompts -> X/Y.
+ * matches the game's Shot[] slot order (and the scrnAddTex1UV sprite sheet).
+ *
+ * Deriving which physical key owns a slot means following the WHOLE chain, not
+ * just ctr/pad.c: keyConvert() runs pad->sw through ioconv_table (IOConv.c),
+ * which deliberately swaps the low and high button halves (0x10<->0x100 ...
+ * 0x80<->0x800) before Convert_User_Setting() indexes Shot[] off the result.
+ * pad.c emitting 0x80 for ZL therefore lands on SWK_LEFT_TRIGGER -> Shot[7],
+ * not Shot[3]. Accounting for that swap, the real owners are:
+ *   0 WEST(X)   1 NORTH(Y)  2 R_SHOULDER(L) 3 L_SHOULDER(ZR)
+ *   4 SOUTH(A)  5 EAST(B)   6 R_TRIGGER(R)  7 L_TRIGGER(ZL)
  * NULL keeps the original art (the big controller diagram at ix 8). */
 extern void ctrDrawButtonGlyph(float x0, float y0, float x1, float y1, const char *label);
 static const char *sf3_btn_label(s32 ix) {
-    /* Glyph per slot, matching the physical 3DS button (ctr/pad.c slot order
-     * A,B,R,ZL,X,Y,L,ZR). ZL/ZR are fully remappable (BUTTON CONFIG), so the
-     * label at each slot MUST match what actually gets bound there — do not
-     * swap these two independently of the binding, or setting an option on
-     * the row labeled "ZL" silently binds physical ZR instead (and vice
-     * versa), which is exactly the wrong-button-fires bug this caused. */
-    static const char *const tbl[8] = { "A", "B", "R", "ZL", "X", "Y", "L", "ZR" };
+    /* Glyph per slot, matching the physical 3DS button that actually drives it
+     * once ioconv_table's half-swap is applied. The label at each slot MUST
+     * match what actually gets bound there -- when these disagreed, the rows
+     * labelled ZL and ZR each edited the other's binding, so binding ZR left
+     * physical ZR dead and gave the function to ZL. */
+    static const char *const tbl[8] = { "X", "Y", "L", "ZR", "A", "B", "R", "ZL" };
     return (ix >= 0 && ix < 8) ? tbl[ix] : NULL;
 }
 
