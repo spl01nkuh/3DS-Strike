@@ -657,6 +657,7 @@ static void atlas_flush_pending_strips(void) {
 }
 /* L8 index cache for atlas: cached morton-tiled 8-bit indices per cell.
    On palette change, re-resolve palette from indices (skip full rebuild). */
+static void atlas_palette_resolve(int cell, const texel_t* pal_colors, u32 pot_w, u32 pot_h);
 static u8* atlas_l8[ATLAS_MAX_CELL_COUNT]; /* 64KB each, heap-allocated */
 static bool atlas_l8_valid[ATLAS_MAX_CELL_COUNT];
 static u32 atlas_builds_total = 0;
@@ -763,14 +764,34 @@ static int atlas_alloc_cell(int cache_idx) {
 
     // No free cell — LRU evict ONLY if oldest cell is stale (60+ frames unused).
     // Prevents thrashing while allowing scene transitions to reclaim cells.
+    //
+    // Victim choice also weighs how expensive the eviction is to UNDO. Measured:
+    // essentially every full rebuild comes from a bind finding no cache entry,
+    // and eviction is what removes them. A cell whose texture indices are still
+    // in the shared L8 cache gets restored by the cross-variant palette resolve
+    // in atlas_build_cell — far cheaper than re-decoding the source. So among
+    // cells that are ALREADY past the staleness rule, prefer evicting one of
+    // those; the eviction count is unchanged, but the rebuild it causes is the
+    // cheap kind. Falls back to plain LRU when no stale cell is cheap to restore.
     u32 oldest = UINT32_MAX;
     int oldest_cell = -1;
+    u32 oldest_cheap = UINT32_MAX;
+    int cheap_cell = -1;
     for (int i = 0; i < atlas_cell_count; i++) {
         int owner = atlas.cell_owner[i];
         if (owner >= 0 && owner < CACHE_MAX && !gpu_cache[owner].pinned) {
-            if (atlas.cell_last_used[i] < oldest) {
-                oldest = atlas.cell_last_used[i];
+            u32 lu = atlas.cell_last_used[i];
+            if (lu < oldest) {
+                oldest = lu;
                 oldest_cell = i;
+            }
+            if (frame_number - lu >= 60) {
+                int ti = gpu_cache[owner].texture_index;
+                if (ti >= 0 && ti < FL_TEXTURE_MAX && lu < oldest_cheap &&
+                    l8_cache_find(ti, texture_versions[ti]) != NULL) {
+                    oldest_cheap = lu;
+                    cheap_cell = i;
+                }
             }
         }
     }
@@ -778,6 +799,10 @@ static int atlas_alloc_cell(int cache_idx) {
     if (oldest_cell >= 0 && frame_number - oldest >= 60) { /* Reverted to original —
         the real fix was routing background chips to the pool path (see
         bgDrawOneChip), not atlas eviction timing. */
+        /* cheap_cell is only ever set for cells already past the staleness
+           rule, so substituting it cannot evict anything the plain-LRU policy
+           would have considered too fresh. */
+        if (cheap_cell >= 0) oldest_cell = cheap_cell;
         int old_owner = atlas.cell_owner[oldest_cell];
         if (old_owner >= 0 && old_owner < CACHE_MAX) {
             CacheEntry* old_entry = &gpu_cache[old_owner];
@@ -833,6 +858,44 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
      * unfilled tiles render invisible by design, same as the reference. */
 
     int pot_tiles_y = (int)(pot_h >> 3);
+
+    /* SIBLING-CELL fast path. Another atlas cell may already hold this exact
+     * texture, at this version and size, decoded for a DIFFERENT palette. Its
+     * atlas_l8 indices are in the identical per-cell layout, so copying them
+     * and running the palette resolve reproduces this variant without touching
+     * the source at all.
+     *
+     * The texture-keyed L8 cache below does the same job but only for full-size
+     * 256x256 PSMT8, because that is where the pool and atlas index layouts
+     * coincide. This one is cell-to-cell, so layout always matches: it covers
+     * ANY size and PSMT4 as well. That is the case that matters for the "heavy
+     * slowdown with lots of effects on screen" report -- fight fx are mostly
+     * sub-cell PSMT4 sheets bound at several palettes at once, and every one of
+     * those variants was previously a full decode. */
+    {
+        int this_tex = (int)(src - src_textures);
+        u8* dst_l8 = atlas_l8[cell];
+        if (dst_l8 && pal_colors && this_tex >= 0 && this_tex < FL_TEXTURE_MAX) {
+            u32 tv = texture_versions[this_tex];
+            for (int c = 0; c < atlas_cell_count; c++) {
+                if (c == cell || !atlas_l8_valid[c] || !atlas_l8[c]) continue;
+                int owner = atlas.cell_owner[c];
+                if (owner < 0 || owner >= CACHE_MAX) continue;
+                const CacheEntry* oe = &gpu_cache[owner];
+                if (!oe->allocated || oe->pending_delete) continue;
+                if (oe->texture_index != this_tex || oe->tex_version != tv) continue;
+                if (oe->pot_w != pot_w || oe->pot_h != pot_h) continue;
+
+                memcpy(dst_l8, atlas_l8[c],
+                       (size_t)(ATLAS_CELL_SIZE >> 3) * (ATLAS_CELL_SIZE >> 3) * 64);
+                atlas_l8_valid[cell] = true;
+                atlas_palette_resolve(cell, pal_colors, pot_w, pot_h);
+                atlas_builds_total++;
+                atlas_builds_period++;
+                return;
+            }
+        }
+    }
 
     if (src->fmt == SCE_GS_PSMT8 && pal_colors) {
         /* Row-based single-pass: sequential source reads, minimal overhead.
@@ -1325,6 +1388,7 @@ static bool src_effectively_empty(const SrcTexture* src) {
         if (bp[off]) return false;
     return bp[n - 1] == 0;
 }
+
 
 static CacheEntry* cache_find_clean(int tex_idx, int pal_idx) {
     CacheEntry* e = cache_find(tex_idx, pal_idx);
@@ -3629,6 +3693,7 @@ void SDLGameRenderer_EndFrame(void) {
     render_task_count = 0;
     cache_flush_pending();  // Actually free textures marked for deletion during this frame
     frame_number++;
+
 }
 
 /* Draw one full-target textured quad using this renderer's own raw C3D
