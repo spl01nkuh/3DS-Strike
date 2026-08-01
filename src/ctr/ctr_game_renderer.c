@@ -401,6 +401,23 @@ typedef struct {
                                 forces one rebuild when content appears. */
     u32 last_used_frame;
     int atlas_cell;      // >=0 if stored in tile atlas, -1 if using pool
+    /* DEFERRED TILE-SCOPED PALETTE RESOLVE (256x256 atlas entries).
+     *
+     * A palette change used to re-resolve the WHOLE cell immediately at bind
+     * time: 65536 texels, a near-constant 2.56ms, and 90-96% of all build time
+     * once a fight is running. Measured, only ~17 of a cell's 1024 tiles are
+     * actually sampled between one resolve and the next -- a ~58x overdraw.
+     *
+     * So the resolve is deferred to RenderFrame, where the full task list is
+     * known, and only the tiles this frame's quads actually read are resolved.
+     *
+     * smp_tiles      - tiles sampled by quads pushed this frame
+     * pal_valid_tiles- tiles already resolved for the CURRENT pal_version.
+     *                  Cleared whenever the palette changes; a tile sampled
+     *                  later is resolved then, so partial coverage stays
+     *                  correct rather than showing the previous palette. */
+    u32 smp_tiles[32];
+    u32 pal_valid_tiles[32];
 } CacheEntry;
 
 /* Pool slots no longer own a C3D_Tex each: slots of the same bucket live as
@@ -1098,7 +1115,11 @@ static void atlas_build_cell(int cell, const SrcTexture* src, const SrcPalette* 
 
 /* Fast palette re-resolve: apply new palette to cached morton-tiled indices.
    ~2× faster than full build — no morton LUT, no source stride, no Y-flip. */
-static void atlas_palette_resolve(int cell, const texel_t* pal_colors, u32 pot_w, u32 pot_h) {
+/* mask: NULL resolves the whole cell (original behaviour). Otherwise a 1024-bit
+   tile bitmap (bit = ty*32+tx, matching the GPU-space tile grid the UVs index)
+   selecting which 8x8 tiles to resolve — see CacheEntry.pal_valid_tiles. */
+static void atlas_palette_resolve_masked(int cell, const texel_t* pal_colors,
+                                         u32 pot_w, u32 pot_h, const u32* mask) {
     if (cell < 0 || cell >= atlas_cell_count || !atlas_l8_valid[cell] || !atlas_l8[cell]) return;
 
     int strip = atlas_cell_strip(cell);
@@ -1116,6 +1137,10 @@ static void atlas_palette_resolve(int cell, const texel_t* pal_colors, u32 pot_w
         int strip_row = ty * strip_tiles_x + cell_in * cell_tiles;
         int l8_row = ty * cell_tiles;
         for (int tx = 0; tx < (int)(pot_w >> 3) && tx < cell_tiles; tx++) {
+            if (mask) {
+                int bit = ty * 32 + tx;
+                if (!(mask[bit >> 5] & (1u << (bit & 31)))) continue;
+            }
             /* Hot loop — this runs for every atlas cell whose palette
              * animates (SF3 fights animate palettes near-constantly). Pack
              * two 16-bit texels per 32-bit store: tile data is 4-byte
@@ -1137,6 +1162,10 @@ static void atlas_palette_resolve(int cell, const texel_t* pal_colors, u32 pot_w
         }
     }
     atlas_mark_strip_dirty(strip);
+}
+
+static void atlas_palette_resolve(int cell, const texel_t* pal_colors, u32 pot_w, u32 pot_h) {
+    atlas_palette_resolve_masked(cell, pal_colors, pot_w, pot_h, NULL);
 }
 
 typedef struct {
@@ -1422,6 +1451,20 @@ static CacheEntry* cache_find_clean(int tex_idx, int pal_idx) {
              * path. */
             if (atlas_l8_valid[e->atlas_cell] && pal_idx >= 0 && pal_idx < FL_PALETTE_MAX
                 && src_palettes[pal_idx].valid) {
+                /* DEFERRED PATH (256x256 cells): do not resolve here. Mark the
+                   whole cell stale for the new palette and let RenderFrame
+                   resolve only the tiles this frame's quads actually sample.
+                   Measured: ~17 of 1024 tiles are used between resolves, so
+                   resolving now would rewrite ~58x more than is read. */
+                if (e->pot_w == 256 && e->pot_h == 256) {
+                    for (int wi = 0; wi < 32; wi++) {
+                        e->pal_valid_tiles[wi] = 0; /* new palette: all stale */
+                        e->smp_tiles[wi] = 0;
+                    }
+                    e->pal_version = cur_pal_ver;
+                    e->dirty = false;
+                    return e;
+                }
                 const u64 t0 = svcGetSystemTick();
                 atlas_palette_resolve(e->atlas_cell, src_palettes[pal_idx].colors,
                                       e->pot_w, e->pot_h);
@@ -1901,6 +1944,13 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
             {   const u64 build_start_tick = svcGetSystemTick();
                 atlas_build_cell(cell, src, pal, pot_w, pot_h);
                 cache_create_ticks_build += svcGetSystemTick() - build_start_tick;
+            }
+            /* A full build resolves the entire cell with this palette, so every
+               tile starts valid; the deferred path below only has to catch up
+               tiles invalidated by LATER palette changes. */
+            for (int wi = 0; wi < 32; wi++) {
+                entry->pal_valid_tiles[wi] = 0xFFFFFFFFu;
+                entry->smp_tiles[wi] = 0;
             }
             entry->dirty = false;
 
@@ -2757,6 +2807,49 @@ static void push_textured_task(
         task->vertex_colors[i] = color;
     }
 
+    /* Record which 8x8 tiles of the atlas cell this quad samples, so
+       resolve rewrites the whole page (~65536 texels, 2.56ms), but a draw takes
+       one sprite out of it. Accumulate the texel area each quad reads, to
+       compare against (resolves x 65536). */
+    /* Record which 8x8 tiles of the atlas cell this quad samples, so
+       RenderFrame's deferred palette resolve can touch only those.
+
+       The task UVs are SOURCE-relative (0..1 over src_w/src_h) — they are
+       scaled into strip space later in resolve_task_texture — so the tile
+       index is (u * src_w)/8, not u*32. And the V axis is FLIPPED: v=0 samples
+       the cell's LAST texel row (see the Y-flip in atlas_build_cell), so the
+       row index is (255 - v*src_h)/8 and the bounds swap. Getting either wrong
+       resolves the wrong tiles and leaves the previous palette showing.
+
+       A one-tile margin absorbs rounding and any half-texel sampling offset;
+       over-resolving a tile is merely wasted work, under-resolving is visible
+       corruption. */
+    if (ce && ce->atlas_cell >= 0 && ce->pot_w == 256 && ce->pot_h == 256 &&
+        ce->src_w > 0 && ce->src_h > 0) {
+        float u0 = us[0], u1 = us[0], v0 = vs[0], v1 = vs[0];
+        for (int i = 1; i < 4; i++) {
+            if (us[i] < u0) u0 = us[i];
+            if (us[i] > u1) u1 = us[i];
+            if (vs[i] < v0) v0 = vs[i];
+            if (vs[i] > v1) v1 = vs[i];
+        }
+        float sw = (float)ce->src_w, sh = (float)ce->src_h;
+        int tx0 = (int)((u0 * sw) * 0.125f) - 1;
+        int tx1 = (int)((u1 * sw) * 0.125f) + 1;
+        /* flipped V: larger v -> smaller GPU row */
+        int ty0 = (int)((255.0f - v1 * sh) * 0.125f) - 1;
+        int ty1 = (int)((255.0f - v0 * sh) * 0.125f) + 1;
+        if (tx0 < 0) tx0 = 0;
+        if (ty0 < 0) ty0 = 0;
+        if (tx1 > 31) tx1 = 31;
+        if (ty1 > 31) ty1 = 31;
+        for (int ty = ty0; ty <= ty1; ty++)
+            for (int tx = tx0; tx <= tx1; tx++) {
+                int bit = ty * 32 + tx;
+                ce->smp_tiles[bit >> 5] |= 1u << (bit & 31);
+            }
+    }
+
     render_task_count++;
 }
 
@@ -3185,6 +3278,43 @@ void SDLGameRenderer_RenderFrame(void) {
 
 
     if (render_task_count == 0) return;
+
+    /* DEFERRED TILE-SCOPED PALETTE RESOLVE.
+     *
+     * Palette changes no longer re-resolve a whole 256x256 cell at bind time
+     * (65536 texels, ~2.56ms, measured at 90-96% of all build time in a
+     * fight). Instead the cell was marked stale, this frame's quads recorded
+     * which tiles they sample, and only tiles that are BOTH sampled and not
+     * yet valid for the current palette are resolved now -- measured ~17 of
+     * 1024, so this is where the ~58x overdraw is reclaimed.
+     *
+     * Runs before atlas_flush_pending_strips below so the resolved bytes are
+     * part of the same upload. Tiles never sampled stay unresolved and cost
+     * nothing; if a later frame samples one, it is caught then, which is what
+     * keeps partial coverage correct rather than showing the old palette. */
+    for (int ti = 0; ti < render_task_count; ti++) {
+        CacheEntry* e = render_tasks[ti].cache_entry;
+        if (!e || !e->allocated || e->atlas_cell < 0) continue;
+        if (e->pot_w != 256 || e->pot_h != 256) continue;
+
+        u32 need[32];
+        u32 any = 0;
+        for (int wi = 0; wi < 32; wi++) {
+            need[wi] = e->smp_tiles[wi] & ~e->pal_valid_tiles[wi];
+            any |= need[wi];
+        }
+        if (!any) continue;
+
+        int pal_idx = e->palette_index;
+        if (pal_idx >= 0 && pal_idx < FL_PALETTE_MAX && src_palettes[pal_idx].valid) {
+            const u64 t0 = svcGetSystemTick();
+            atlas_palette_resolve_masked(e->atlas_cell, src_palettes[pal_idx].colors,
+                                         e->pot_w, e->pot_h, need);
+            cache_create_ticks_build += svcGetSystemTick() - t0;
+            for (int wi = 0; wi < 32; wi++) e->pal_valid_tiles[wi] |= need[wi];
+        }
+        for (int wi = 0; wi < 32; wi++) e->smp_tiles[wi] = 0;
+    }
 
     // Flush atlas strips before GPU reads — builds/resolves/region updates
     // may have written mid-frame. One flush per DIRTY strip (tracked by
