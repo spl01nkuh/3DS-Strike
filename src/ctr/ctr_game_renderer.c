@@ -2655,7 +2655,13 @@ static void cache_mark_texture_dirty(int tex_idx) {
         if (e->texture_index != tex_idx) continue;
         /* pinned entries still get dirty — pinning only prevents eviction */
         e->dirty = true;
-        queue_pending_texture(e->texture_index, e->palette_index);
+        /* Deliberately NOT queued for rebuild. Marking dirty is correctness;
+           queuing was speculation, and it was nearly all waste — measured
+           ~800-1150 speculative builds per 300 frames with only 8-83 ever
+           bound. SF3 animates palettes continuously, so an entry dirtied here
+           is usually re-dirtied before anything draws it. Rebuild happens on
+           demand in SDLGameRenderer_SetTexture, which already handles a dirty
+           entry (cache_find_clean rejects it, cache_create rebuilds). */
     }
 }
 
@@ -2665,7 +2671,7 @@ static void cache_mark_palette_dirty(int pal_idx) {
         if (!e->allocated || e->pending_delete) continue;
         if (e->palette_index != pal_idx) continue;
         e->dirty = true;
-        queue_pending_texture(e->texture_index, e->palette_index);
+        /* not queued — see cache_mark_texture_dirty; rebuilt on demand at bind */
     }
 }
 
@@ -3962,10 +3968,20 @@ void SDLGameRenderer_DrawGlyphQuad(void* tex_v, float x0, float y0, float x1, fl
 // Adaptive budget: if pending queue is large (transition/screen load),
 // spend more time building so screens appear quickly. During fights
 // (small queue), use a conservative budget to preserve frame time.
-#define TEXTURE_PENDING_MIN_PER_FRAME 8
+/* MIN_PER_FRAME is a forward-progress floor: the budget check below is
+   skipped until this many builds are done, so it is spent unconditionally
+   every frame. At 8 it made the "conservative budget" unreachable — measured
+   6.4-11.5ms per frame inside a fight, the single largest phase in the frame.
+   And it is nearly all waste: of ~800-1150 speculative builds per 300 frames,
+   only 8-83 were ever bound (~99% never drawn). Palette/texture versions bump
+   faster than the queue drains, so a speculatively built pair goes stale
+   before anything binds it and is rebuilt again next frame.
+   2 still guarantees the queue drains; SDLGameRenderer_SetTexture rebuilds
+   on demand for anything that IS drawn, so nothing can go missing. */
+#define TEXTURE_PENDING_MIN_PER_FRAME 2
 #define TEXTURE_PENDING_MAX_NORMAL 24
 #define TEXTURE_PENDING_MAX_BURST 128
-#define TEXTURE_PENDING_BUDGET_NORMAL_US 6000
+#define TEXTURE_PENDING_BUDGET_NORMAL_US 2000
 #define TEXTURE_PENDING_BUDGET_BURST_US 12000
 #define TEXTURE_PENDING_BURST_THRESHOLD 16
 void SDLGameRenderer_ProcessPending(void) {
@@ -4546,8 +4562,7 @@ void SDLGameRenderer_CreatePalette(unsigned int ph) {
                 if (!e->allocated || e->pending_delete) continue;
                 if (e->palette_index != idx) continue;
                 if (e->pal_version != palette_versions[idx]) {
-                    e->dirty = true;
-                    queue_pending_texture(e->texture_index, e->palette_index);
+                    e->dirty = true;   /* rebuilt on demand at bind */
                 }
             }
         } else {
