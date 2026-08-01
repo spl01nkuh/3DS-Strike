@@ -136,8 +136,23 @@ typedef struct {
     s32 palo;      /* cx mode: the player's color code (wk->colcd) */
     u32 next_cg;
     u32 decoded;   /* wrap guard: stop if we decode more than capacity */
-    u16 palts[8];  /* distinct DRAW palettes this group's chips bind (from
-                      trsptr->attr) — feeds the renderer pre-build pass */
+    /* Distinct DRAW palettes this group's chips bind (from trsptr->attr) —
+     * feeds the state-3 renderer pre-build pass.
+     *
+     * Was 8, which silently truncated: measured in a Gill fight, the table
+     * filled and then DROPPED 387 further distinct palettes in a single 5s
+     * window, so the pass did not pre-build entries it is documented to cover
+     * and those chips paid a full build on first bind.
+     *
+     * COVERAGE FIX, NOT A SPEED FIX — say so plainly. Widening to 32 was
+     * measured: dropped palettes went 387 -> 0 and build time did NOT change
+     * (4247/5530/6419ms against 4742/6318ms before), because the palettes being
+     * dropped are not the expensive ones. 16 is the conservative value: it
+     * closes most of the gap while limiting how many extra PrewarmTexture
+     * entries compete for pool/atlas slots, which with ~200 live (tex,pal)
+     * pairs is a real if unmeasured risk. Do not raise this expecting frames. */
+#define PREWARM_PALTS_MAX 16
+    u16 palts[PREWARM_PALTS_MAX];
     u8 palt_n;
     u8 rp_page;    /* renderer-pass cursors (state 3), resume across frames */
     u8 rp_palt;
@@ -456,7 +471,7 @@ void mlt_prewarm_tick(void) {
                      * pass (the "CAPCOM logo treatment" for fights/stages). */
                     {
                         u16 dp = job->cx ? 0 : (u16)(trsptr->attr & 0x1FF);
-                        if (job->palt_n < 8) {
+                        if (job->palt_n < PREWARM_PALTS_MAX) {
                             int pk;
                             for (pk = 0; pk < job->palt_n; pk++)
                                 if (job->palts[pk] == dp) break;
