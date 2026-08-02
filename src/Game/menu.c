@@ -536,8 +536,13 @@ void toSelectGame(struct _TASK* task_ptr) {
 }
 
 void imgSelectGameButton() {
-    dispButtonImage2(0x74, 0x6B, 0x18, 0x20, 0x1A, 0, 0); /* A = Yes */
-    dispButtonImage2(0xB2, 0x6B, 0x18, 0x20, 0x1A, 0, 1); /* B = No  */
+    /* Slot index, not a glyph index: sf3_btn_label maps 0->"X" and 1->"Y",
+       so these drew (X) YES / (Y) NO. The buttons themselves are read as raw
+       physical A/B below (SWK_WEST/SWK_NORTH), so the labels were simply
+       naming the wrong keys. A is slot 4, B is slot 5 — same convention
+       EFFA8.c already uses for the sound-test prompts. */
+    dispButtonImage2(0x74, 0x6B, 0x18, 0x20, 0x1A, 0, 4); /* A = Yes */
+    dispButtonImage2(0xB2, 0x6B, 0x18, 0x20, 0x1A, 0, 5); /* B = No  */
 }
 
 void Training_Mode(struct _TASK* task_ptr) {
@@ -4210,7 +4215,8 @@ s32 Pause_1st_Sub(struct _TASK* task_ptr) {
 
     if (Pause_Down) {
         SSPutStr2(17, 12, 9, "PRESS   BUTTON");
-        dispButtonImage2(0xB2, 0x5B, 1, 0x13, 0xF, 0, 0); /* A = confirm, matches the SWK_WEST check below */
+        /* Slot 4 = "A" (slot 0 is "X"), matching the SWK_WEST check below. */
+        dispButtonImage2(0xB2, 0x5B, 1, 0x13, 0xF, 0, 4); /* A = confirm */
         SSPutStr2(18, 14, 9, "TO PAUSE MENU");
     }
 
