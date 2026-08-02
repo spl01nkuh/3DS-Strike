@@ -230,8 +230,23 @@ static void afs_reopen_async_fd(void) {
  * cache file data by index: a re-read becomes a memcpy instead of disk I/O.
  * Budget-bounded LRU; only small files are cached (big scene loads are
  * one-shot and bypass the cache). No threads — avoids the async deadlock. */
-#define AFS_CACHE_BUDGET   (44 * 1024 * 1024) /* holds the full ~30MB preload set + session content; Old-3DS 64MB audit (task #12) must revisit — the per-char 558-571 mapping would let this shrink back */
-#define AFS_CACHE_MAX_FILE (9 * 1024 * 1024)  /* cache multi-MB stage/fx files too — some are re-read 2-4x */
+/* Budget was 44MB, sized to hold the ~30MB boot preload set — but that preload
+   was deleted (2026-07-28), so the justification went with it. On Old 3DS the
+   app heap is ~64MB and the fl system arena already takes 24MB of it, so a
+   44MB cache can never be satisfied: it simply grew until malloc started
+   failing. Measured symptom — heap used climbed 41MB -> 55MB with only 140KB
+   free and a largest free block of 8-31KB, at which point BGM's 191KB segment
+   allocation failed, adxPlayInternal bailed, and music went silent for
+   seconds at a time while the game respun the segment queue.
+
+   MAX_FILE was 9MB, which cached multi-MB one-shot stage/fx files and is what
+   wrecked the hit rate: measured 3 hits against 15 misses while holding 13MB.
+   That also contradicted this file's own header comment ("only small files are
+   cached, big scene loads are one-shot and bypass the cache") — restoring a
+   small cap restores the documented design. Small files are the ones actually
+   re-read, and they still fit comfortably. */
+#define AFS_CACHE_BUDGET   (8 * 1024 * 1024)
+#define AFS_CACHE_MAX_FILE (512 * 1024)
 #define AFS_CACHE_SLOTS    512
 typedef struct { s32 fnum; u32 size; u8* data; u32 last_use; } AfsCacheSlot;
 static AfsCacheSlot afs_cache[AFS_CACHE_SLOTS];
