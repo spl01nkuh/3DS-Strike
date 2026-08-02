@@ -642,20 +642,15 @@ void endFrame() {
             extern void debug_print(const char *fmt, ...);
             extern int cache_fail_invalid_get(void), cache_fail_too_big_get(void),
                        cache_fail_texinit_get(void), cache_fail_noslot_get(void);
-            extern int dbg_task_repurposed;
-            extern int dbg_regionupd_calls, dbg_regionupd_patched;
             extern unsigned int dbg_settex_miss(void), dbg_settex_create(void),
                                 dbg_settex_fail(void), dbg_atlas_evict(void);
-            extern int dbg_cache_full_returns;
             static int pf;
             if ((++pf & 7) == 0) {
-                debug_print("RENDPROF %s pend=%d inv=%d big=%d tini=%d nslot=%d rep=%d ru=%d/%d stm=%u stc=%u stf=%u aev=%u cf=%d",
+                debug_print("RENDPROF %s pend=%d inv=%d big=%d tini=%d nslot=%d stm=%u stc=%u stf=%u aev=%u",
                             SDLGameRenderer_GetProfile(), SDLGameRenderer_GetPendingCount(),
                             cache_fail_invalid_get(), cache_fail_too_big_get(),
                             cache_fail_texinit_get(), cache_fail_noslot_get(),
-                            dbg_task_repurposed, dbg_regionupd_calls, dbg_regionupd_patched,
-                            dbg_settex_miss(), dbg_settex_create(), dbg_settex_fail(), dbg_atlas_evict(),
-                            dbg_cache_full_returns);
+                            dbg_settex_miss(), dbg_settex_create(), dbg_settex_fail(), dbg_atlas_evict());
             }
         }
 #endif

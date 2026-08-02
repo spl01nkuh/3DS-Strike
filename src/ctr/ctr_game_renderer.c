@@ -1791,7 +1791,6 @@ static void cache_update_entry_region(CacheEntry* entry, int x, int y, int w, in
     }
 }
 
-int dbg_cache_full_returns = 0; /* PORT DIAG: cache_create's uncounted "all N in use" NULL. TEMP */
 
 // Build a GPU texture from source data + palette, with morton tiling.
 // The texture is palette-resolved to linear RGBA in a staging buffer,
@@ -1874,7 +1873,6 @@ static CacheEntry* cache_create(int tex_idx, int pal_idx) {
             entry->allocated = false;
             entry->pool_slot = -1;
         } else {
-            dbg_cache_full_returns++; /* all metadata slots in use this frame (profile) */
             return NULL;
         }
     }
@@ -2367,7 +2365,6 @@ typedef struct {
     s16 dbg_pal;
 } RenderTask;
 
-int dbg_task_repurposed = 0; /* mid-frame entry recycling counter (profile) */
 
 static RenderTask render_tasks[RENDER_TASK_MAX];
 static int render_task_count = 0;
@@ -3038,7 +3035,6 @@ static C3D_Tex* resolve_task_texture(const RenderTask* task,
         /* Entry recycled for a different (tex,pal) since the task was
            queued — drop the quad rather than sampling the wrong content. */
         if (ce->texture_index != task->dbg_tex || ce->palette_index != task->dbg_pal) {
-            dbg_task_repurposed++;
             return NULL;
         }
 
@@ -4238,13 +4234,9 @@ void SDLGameRenderer_UnlockTexture(unsigned int th) {
     }
 }
 
-int dbg_regionupd_calls = 0;   /* PORT DIAG. TEMP */
-int dbg_regionupd_patched = 0; /* PORT DIAG. TEMP */
-
 void SDLGameRenderer_UpdateTextureRegion(unsigned int th, int x, int y, int w, int h) {
     int idx = (int)th - 1;
     if (idx < 0 || idx >= FL_TEXTURE_MAX) return;
-    dbg_regionupd_calls++;
 
     /* Mark the affected 8×8 tiles in the ever-active bitmap AND the per-frame
      * melt-pending bitmap. All patching (L8 index cache + palette-variant GPU
@@ -4292,7 +4284,6 @@ void SDLGameRenderer_UpdateTextureRegion(unsigned int th, int x, int y, int w, i
               if (!e->allocated || e->pending_delete) continue;
               if (e->texture_index != idx) continue;
               cache_update_entry_region(e, x, y, w, h);
-              dbg_regionupd_patched++;
           }
       }
     }
@@ -4438,7 +4429,6 @@ static void melt_flush_pending(void) {
                 for (int i = 0; i < en; i++) {
                     cache_update_entry_region(ents[i], tx0 * 8, ty * 8,
                                               (tx1 - tx0 + 1) * 8, 8);
-                    dbg_regionupd_patched++;
                 }
             }
         }
